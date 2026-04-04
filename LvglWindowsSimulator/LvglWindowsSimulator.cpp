@@ -4,9 +4,10 @@
 #include <LvglWindowsIconResource.h>
 
 #include "lvgl/lvgl.h"
-#include "ui/golden_screen.h"
+#include "ui/screen_manager.h"
 #include "ui/gauge_data.h"
 #include "ui/map_renderer.h"
+#include "ui/golden_screen.h"
 
 /*
  * Marine Gauge Simulator — Golden Screen
@@ -37,6 +38,8 @@ static void sim_data_init(void)
     sim_data.lambda1 = 1.00f;
     sim_data.lambda2 = 1.00f;
     sim_data.iat_c = 32;
+    sim_data.latitude = 45.00;
+    sim_data.longitude = 14.61;
     sim_data.sog_knots = 7.2f;
     sim_data.cog_degrees = 247;
     sim_data.depth_m = 8.5f;
@@ -80,6 +83,13 @@ static void sim_data_update(void)
     sim_data.sog_knots = 8.0f + 6.0f * sinf(t * 0.15f);
     sim_data.depth_m = 6.0f + 5.0f * sinf(t * 0.08f);
 
+    /* GPS: slow circle near Punat (~0.01 deg radius ≈ 1km) */
+    float gps_t = t * 0.05f;
+    sim_data.latitude  = 45.00 + 0.01 * sin(gps_t);
+    sim_data.longitude = 14.61 + 0.01 * cos(gps_t);
+    sim_data.cog_degrees = fmodf(90.0f - gps_t * 180.0f / 3.14159f, 360.0f);
+    if (sim_data.cog_degrees < 0) sim_data.cog_degrees += 360.0f;
+
     sim_data.fuel_rate_lph = 5 + (sim_data.rpm / 6000.0f) * 30.0f;
     sim_data.fuel_pressure_kpa = 370 + 20 * sinf(t * 0.5f);
     sim_data.coolant_pressure_kpa = 45 + 20 * sinf(t * 0.35f);
@@ -87,22 +97,38 @@ static void sim_data_update(void)
 
 static bool key_plus_was_down = false;
 static bool key_minus_was_down = false;
+static bool key_left_was_down = false;
+static bool key_right_was_down = false;
 
 static void sim_timer_cb(lv_timer_t* timer)
 {
     (void)timer;
     sim_data_update();
-    golden_screen_update(&sim_data);
+    screen_manager_update(&sim_data);
 
     /* Poll +/- keys for map zoom (edge-triggered) */
     bool plus_down = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) != 0;
     bool minus_down = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) != 0;
 
-    if (plus_down && !key_plus_was_down)  map_renderer_zoom_in();
-    if (minus_down && !key_minus_was_down) map_renderer_zoom_out();
+    /* Zoom whichever map is on the active screen */
+    map_renderer_t* active_map = screen_manager_get_active_map();
+    if (active_map) {
+        if (plus_down && !key_plus_was_down)  map_renderer_zoom_in(active_map);
+        if (minus_down && !key_minus_was_down) map_renderer_zoom_out(active_map);
+    }
 
     key_plus_was_down = plus_down;
     key_minus_was_down = minus_down;
+
+    /* Poll arrow keys for screen navigation (edge-triggered) */
+    bool left_down = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
+    bool right_down = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
+
+    if (left_down && !key_left_was_down)   screen_manager_prev();
+    if (right_down && !key_right_was_down) screen_manager_next();
+
+    key_left_was_down = left_down;
+    key_right_was_down = right_down;
 }
 
 int main()
@@ -162,11 +188,11 @@ int main()
         return -1;
     }
 
-    /* Initialize simulated data and create the golden screen */
+    /* Initialize simulated data and create all screens */
     sim_data_init();
-    golden_screen_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
-    golden_screen_create();
-    golden_screen_update(&sim_data);
+    screen_manager_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
+    screen_manager_create();
+    screen_manager_update(&sim_data);
 
     /* Timer to update simulated data at ~50Hz */
     lv_timer_create(sim_timer_cb, 20, NULL);
