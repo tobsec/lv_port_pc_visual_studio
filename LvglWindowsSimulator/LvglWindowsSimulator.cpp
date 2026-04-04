@@ -150,6 +150,7 @@ int main()
 
     /* Initialize simulated data and create the golden screen */
     sim_data_init();
+    golden_screen_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
     golden_screen_create();
     golden_screen_update(&sim_data);
 
