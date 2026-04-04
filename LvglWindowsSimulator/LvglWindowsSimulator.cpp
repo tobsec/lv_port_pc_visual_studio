@@ -6,6 +6,7 @@
 #include "lvgl/lvgl.h"
 #include "ui/golden_screen.h"
 #include "ui/gauge_data.h"
+#include "ui/map_renderer.h"
 
 /*
  * Marine Gauge Simulator — Golden Screen
@@ -84,11 +85,24 @@ static void sim_data_update(void)
     sim_data.coolant_pressure_kpa = 45 + 20 * sinf(t * 0.35f);
 }
 
+static bool key_plus_was_down = false;
+static bool key_minus_was_down = false;
+
 static void sim_timer_cb(lv_timer_t* timer)
 {
     (void)timer;
     sim_data_update();
     golden_screen_update(&sim_data);
+
+    /* Poll +/- keys for map zoom (edge-triggered) */
+    bool plus_down = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) != 0;
+    bool minus_down = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) != 0;
+
+    if (plus_down && !key_plus_was_down)  map_renderer_zoom_in();
+    if (minus_down && !key_minus_was_down) map_renderer_zoom_out();
+
+    key_plus_was_down = plus_down;
+    key_minus_was_down = minus_down;
 }
 
 int main()
