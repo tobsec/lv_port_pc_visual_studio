@@ -47,6 +47,13 @@ void map_renderer_set_position(map_renderer_t* mr, double lat, double lon, float
 void map_renderer_track(map_renderer_t* mr);
 
 /**
+ * Enable a vignette fade: radial edge fade + vertical bottom fade.
+ * @param fade_start_pct  Where vertical fade begins (0.0=top, 1.0=bottom).
+ * @param color           Color to fade toward (should match background).
+ */
+void map_renderer_set_vignette(map_renderer_t* mr, float fade_start_pct, lv_color_t color);
+
+/**
  * Create the re-center button on a parent that sits ABOVE the chart area.
  * Must be called after map_renderer_create, passing the root/tile container.
  */

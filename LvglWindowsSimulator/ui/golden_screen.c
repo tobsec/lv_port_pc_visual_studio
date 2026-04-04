@@ -284,10 +284,9 @@ void golden_screen_create(lv_obj_t* parent)
     lv_obj_center(chart_area);
     lv_obj_set_style_radius(chart_area, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_clip_corner(chart_area, true, 0);
-    lv_obj_set_style_bg_color(chart_area, COL_CHART_BG, 0);
+    lv_obj_set_style_bg_color(chart_area, COL_BG, 0);
     lv_obj_set_style_bg_opa(chart_area, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(chart_area, lv_color_hex(0x1a2540), 0);
-    lv_obj_set_style_border_width(chart_area, 1, 0);
+    lv_obj_set_style_border_width(chart_area, 0, 0);
     lv_obj_set_style_pad_all(chart_area, 0, 0);
     lv_obj_set_scrollbar_mode(chart_area, LV_SCROLLBAR_MODE_OFF);
 
@@ -296,7 +295,7 @@ void golden_screen_create(lv_obj_t* parent)
         gs_map = map_renderer_create(chart_area, tile_path, 600);
         if (gs_map) {
             map_renderer_set_view(gs_map, 45.00, 14.61, 13);
-            /* Track button on root, positioned inside chart area (above bar backdrop) */
+            map_renderer_set_vignette(gs_map, 0.65f, COL_BG);
             map_renderer_create_track_btn(gs_map, root, 220, 60);
         }
     }

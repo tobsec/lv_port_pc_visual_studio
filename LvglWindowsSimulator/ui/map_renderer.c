@@ -31,6 +31,9 @@ struct map_renderer {
     bool       pos_valid;
     bool       tracking;
 
+    float      vignette_start;  /* 0.0 = disabled, else fraction from top where fade begins */
+    uint16_t   vignette_color;  /* RGB565 color to fade toward (usually background) */
+
     uint8_t    tile_buf[TILE_BYTES];
 };
 
@@ -191,6 +194,62 @@ static void render(map_renderer_t* mr)
     }
 
     draw_marker(mr);
+
+    /* Apply vignette: radial edge fade + vertical bottom fade */
+    if (mr->vignette_start > 0.0f) {
+        int32_t half = mr->vp_size / 2;
+        int32_t fade_y = (int32_t)(mr->vp_size * mr->vignette_start);
+        int32_t fade_len = mr->vp_size - fade_y;
+        /* Radial fade: fully visible inside 88% of radius, fade to black at edge */
+        int32_t r_inner = half * 88 / 100;
+        int32_t r_outer = half;
+        int32_t r_range = r_outer - r_inner;
+
+        uint16_t* pixels = (uint16_t*)mr->canvas_buf;
+        for (int32_t y = 0; y < mr->vp_size; y++) {
+            for (int32_t x = 0; x < mr->vp_size; x++) {
+                int32_t dx = x - half;
+                int32_t dy = y - half;
+
+                /* Radial alpha (edge fade) */
+                /* Use integer sqrt approximation: dist² compared to r² thresholds */
+                int32_t dist_sq = dx * dx + dy * dy;
+                int32_t radial_alpha = 255;
+                if (dist_sq >= r_outer * r_outer) {
+                    radial_alpha = 0;
+                } else if (dist_sq > r_inner * r_inner) {
+                    /* Linear fade between r_inner and r_outer */
+                    /* Approximate: use dist_sq vs r_sq for smoother curve */
+                    int32_t inner_sq = r_inner * r_inner;
+                    int32_t outer_sq = r_outer * r_outer;
+                    radial_alpha = 255 - (dist_sq - inner_sq) * 255 / (outer_sq - inner_sq);
+                }
+
+                /* Vertical alpha (bottom fade) */
+                int32_t vert_alpha = 255;
+                if (fade_len > 0 && y > fade_y) {
+                    vert_alpha = 255 - (y - fade_y) * 255 / fade_len;
+                    if (vert_alpha < 0) vert_alpha = 0;
+                }
+
+                /* Combined alpha */
+                int32_t alpha = radial_alpha * vert_alpha / 255;
+                if (alpha >= 255) continue;
+
+                uint16_t px = pixels[y * mr->vp_size + x];
+                /* Lerp: result = src * alpha + target * (255 - alpha) */
+                int32_t inv = 255 - alpha;
+                int32_t tr = (mr->vignette_color >> 11) & 0x1F;
+                int32_t tg = (mr->vignette_color >> 5) & 0x3F;
+                int32_t tb = mr->vignette_color & 0x1F;
+                int32_t r = (((px >> 11) & 0x1F) * alpha + tr * inv) / 255;
+                int32_t g = (((px >> 5) & 0x3F) * alpha + tg * inv) / 255;
+                int32_t b = ((px & 0x1F) * alpha + tb * inv) / 255;
+                pixels[y * mr->vp_size + x] = (r << 11) | (g << 5) | b;
+            }
+        }
+    }
+
     lv_obj_invalidate(mr->canvas_obj);
 }
 
@@ -347,6 +406,15 @@ void map_renderer_create_track_btn(map_renderer_t* mr, lv_obj_t* btn_parent,
     lv_label_set_text(lbl, LV_SYMBOL_GPS);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
     lv_obj_center(lbl);
+}
+
+void map_renderer_set_vignette(map_renderer_t* mr, float fade_start_pct, lv_color_t color)
+{
+    mr->vignette_start = fade_start_pct;
+    /* Convert lv_color_t to RGB565 */
+    mr->vignette_color = ((color.red >> 3) << 11) |
+                         ((color.green >> 2) << 5) |
+                          (color.blue >> 3);
 }
 
 double map_renderer_get_lat(map_renderer_t* mr) { return mr->center_lat; }
