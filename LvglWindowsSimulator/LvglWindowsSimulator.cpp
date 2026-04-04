@@ -50,15 +50,15 @@ static void sim_data_update(void)
     /* Slow sinusoidal sweep for smooth demo */
     float t = sim_tick * 0.002f;
 
-    /* RPM: idle 850 → cruise 3500 → WOT 6500, with a smooth cycle */
-    float rpm_base = 3500.0f + 2800.0f * sinf(t * 0.7f);
-    sim_data.rpm = fmaxf(600, fminf(7800, rpm_base + 200 * sinf(t * 3.0f)));
+    /* RPM: idle 700 → cruise 3000 → WOT 5800, with a smooth cycle */
+    float rpm_base = 3000.0f + 2500.0f * sinf(t * 0.7f);
+    sim_data.rpm = fmaxf(500, fminf(5800, rpm_base + 150 * sinf(t * 3.0f)));
 
     /* MAP follows RPM loosely */
-    sim_data.map_kpa = 30 + (sim_data.rpm / 8000.0f) * 80.0f + 5 * sinf(t * 2.0f);
+    sim_data.map_kpa = 30 + (sim_data.rpm / 6000.0f) * 80.0f + 5 * sinf(t * 2.0f);
 
     /* Oil pressure follows RPM */
-    sim_data.oil_pressure_kpa = 150 + (sim_data.rpm / 8000.0f) * 350.0f;
+    sim_data.oil_pressure_kpa = 150 + (sim_data.rpm / 6000.0f) * 350.0f;
 
     /* Temperatures drift slowly */
     sim_data.oil_temp_c = 85 + 15 * sinf(t * 0.3f);
@@ -79,7 +79,7 @@ static void sim_data_update(void)
     sim_data.sog_knots = 8.0f + 6.0f * sinf(t * 0.15f);
     sim_data.depth_m = 6.0f + 5.0f * sinf(t * 0.08f);
 
-    sim_data.fuel_rate_lph = 5 + (sim_data.rpm / 8000.0f) * 30.0f;
+    sim_data.fuel_rate_lph = 5 + (sim_data.rpm / 6000.0f) * 30.0f;
     sim_data.fuel_pressure_kpa = 370 + 20 * sinf(t * 0.5f);
     sim_data.coolant_pressure_kpa = 45 + 20 * sinf(t * 0.35f);
 }
