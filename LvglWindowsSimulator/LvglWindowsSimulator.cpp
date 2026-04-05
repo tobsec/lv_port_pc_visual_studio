@@ -196,7 +196,7 @@ int main()
     screen_manager_update(&sim_data);
 
     /* Timer to update simulated data at ~50Hz */
-    lv_timer_create(sim_timer_cb, 20, NULL);
+    lv_timer_create(sim_timer_cb, 50, NULL);  /* 20Hz data update */
 
     while (1)
     {

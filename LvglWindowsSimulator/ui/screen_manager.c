@@ -206,8 +206,13 @@ void screen_manager_update(const gauge_data_t* d)
     golden_screen_update(d);
 
     /* Update Screen 2: map position + SOG/COG overlay */
-    if (s2_map && d->latitude != 0.0 && d->longitude != 0.0) {
-        map_renderer_set_position(s2_map, d->latitude, d->longitude, d->cog_degrees);
+    /* Only update screen 2 map when visible, throttled to ~2Hz */
+    static uint32_t s2_map_frame = 0;
+    if (current_screen == 1 && ++s2_map_frame >= 10) {
+        s2_map_frame = 0;
+        if (s2_map && d->latitude != 0.0 && d->longitude != 0.0) {
+            map_renderer_set_position(s2_map, d->latitude, d->longitude, d->cog_degrees);
+        }
     }
     snprintf(buf, sizeof(buf), "%.1f kn", d->sog_knots);
     lv_label_set_text(s2_sog_label, buf);
