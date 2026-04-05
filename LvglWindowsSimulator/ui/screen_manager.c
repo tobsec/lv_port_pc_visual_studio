@@ -12,6 +12,7 @@
 #define COL_CHART_BG    lv_color_hex(0x0a1628)
 
 static const char* tile_path = NULL;
+static const char* alt_tile_path = NULL;
 static lv_obj_t* tileview;
 static int32_t current_screen = 0;
 #define NUM_SCREENS 3
@@ -77,6 +78,9 @@ static void create_screen2(lv_obj_t* tile)
         if (s2_map) {
             map_renderer_set_view(s2_map, 45.00, 14.61, 13);
             map_renderer_create_track_btn(s2_map, tile, 250, 200);
+            if (alt_tile_path) {
+                map_renderer_set_alt_tiles(s2_map, alt_tile_path, tile, -250, 200);
+            }
         }
     }
 
@@ -149,6 +153,12 @@ void screen_manager_set_tile_path(const char* path)
 {
     tile_path = path;
     golden_screen_set_tile_path(path);
+}
+
+void screen_manager_set_alt_tile_path(const char* path)
+{
+    alt_tile_path = path;
+    golden_screen_set_alt_tile_path(path);
 }
 
 void screen_manager_create(void)

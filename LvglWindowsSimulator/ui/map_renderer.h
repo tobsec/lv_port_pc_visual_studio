@@ -61,6 +61,13 @@ void map_renderer_create_track_btn(map_renderer_t* mr, lv_obj_t* btn_parent,
     int32_t x_ofs, int32_t y_ofs);
 
 /**
+ * Set an alternative tile path and create a toggle button.
+ * Clicking the button switches between the primary and alt tile sets.
+ */
+void map_renderer_set_alt_tiles(map_renderer_t* mr, const char* alt_tile_base,
+    lv_obj_t* btn_parent, int32_t x_ofs, int32_t y_ofs);
+
+/**
  * Get current view state.
  */
 double map_renderer_get_lat(map_renderer_t* mr);

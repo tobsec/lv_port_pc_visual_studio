@@ -31,8 +31,13 @@ struct map_renderer {
     bool       pos_valid;
     bool       tracking;
 
-    float      vignette_start;  /* 0.0 = disabled, else fraction from top where fade begins */
-    uint16_t   vignette_color;  /* RGB565 color to fade toward (usually background) */
+    float      vignette_start;
+    uint16_t   vignette_color;
+
+    char       tile_primary[PATH_BUF_LEN];  /* original tile path */
+    char       tile_alt[PATH_BUF_LEN];     /* alternative tile path */
+    bool       using_alt;
+    lv_obj_t*  theme_btn;
 
     uint8_t    tile_buf[TILE_BYTES];
 };
@@ -295,6 +300,8 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
     memset(mr, 0, sizeof(*mr));
 
     strncpy(mr->tile_base, tile_base, PATH_BUF_LEN - 1);
+    strncpy(mr->tile_primary, tile_base, PATH_BUF_LEN - 1);
+    mr->tile_primary[PATH_BUF_LEN - 1] = '\0';
     mr->vp_size = viewport_size;
     mr->tracking = true;
     mr->current_zoom = 13;
@@ -404,6 +411,44 @@ void map_renderer_create_track_btn(map_renderer_t* mr, lv_obj_t* btn_parent,
 
     lv_obj_t* lbl = lv_label_create(mr->track_btn);
     lv_label_set_text(lbl, LV_SYMBOL_GPS);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_center(lbl);
+}
+
+static void theme_btn_cb(lv_event_t* e)
+{
+    map_renderer_t* mr = (map_renderer_t*)lv_event_get_user_data(e);
+    if (mr->tile_alt[0] == '\0') return;
+
+    mr->using_alt = !mr->using_alt;
+    strncpy(mr->tile_base,
+        mr->using_alt ? mr->tile_alt : mr->tile_primary,
+        PATH_BUF_LEN - 1);
+    render(mr);
+    lv_event_stop_bubbling(e);
+    lv_event_stop_processing(e);
+}
+
+void map_renderer_set_alt_tiles(map_renderer_t* mr, const char* alt_tile_base,
+    lv_obj_t* btn_parent, int32_t x_ofs, int32_t y_ofs)
+{
+    strncpy(mr->tile_alt, alt_tile_base, PATH_BUF_LEN - 1);
+    mr->tile_alt[PATH_BUF_LEN - 1] = '\0';
+    mr->using_alt = false;
+
+    mr->theme_btn = lv_button_create(btn_parent);
+    lv_obj_set_size(mr->theme_btn, 40, 40);
+    lv_obj_align(mr->theme_btn, LV_ALIGN_CENTER, x_ofs, y_ofs);
+    lv_obj_set_style_radius(mr->theme_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(mr->theme_btn, lv_color_hex(0x21262d), 0);
+    lv_obj_set_style_bg_opa(mr->theme_btn, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(mr->theme_btn, 0, 0);
+    lv_obj_add_event_cb(mr->theme_btn, theme_btn_cb, LV_EVENT_CLICKED, mr);
+    lv_obj_remove_flag(mr->theme_btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_remove_flag(mr->theme_btn, LV_OBJ_FLAG_SCROLL_CHAIN);
+
+    lv_obj_t* lbl = lv_label_create(mr->theme_btn);
+    lv_label_set_text(lbl, LV_SYMBOL_IMAGE);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
     lv_obj_center(lbl);
 }

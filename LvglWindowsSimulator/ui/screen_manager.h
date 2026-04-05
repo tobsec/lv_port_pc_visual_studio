@@ -12,6 +12,7 @@ extern "C" {
  * Set the tile base path for the map renderer (call before screen_manager_create).
  */
 void screen_manager_set_tile_path(const char* path);
+void screen_manager_set_alt_tile_path(const char* path);
 
 /**
  * Create the screen manager with all screens inside a tileview.

@@ -25,6 +25,7 @@
 
 /* Tile base path — set before golden_screen_create() */
 static const char* tile_path = NULL;
+static const char* alt_tile_path = NULL;
 static map_renderer_t* gs_map = NULL;
 
 /* ── Widget handles for update ── */
@@ -33,18 +34,18 @@ static lv_obj_t* rpm_needle;
 static lv_obj_t* sog_label;
 static lv_obj_t* depth_label;
 static lv_obj_t* watertemp_label;
-static lv_obj_t* oilt_bar;
-static lv_obj_t* oilt_val;
-static lv_obj_t* oilp_bar;
-static lv_obj_t* oilp_val;
-static lv_obj_t* clt_bar;
-static lv_obj_t* clt_val;
-static lv_obj_t* lambda_bar;
-static lv_obj_t* lambda_val;
-static lv_obj_t* cltp_bar;
-static lv_obj_t* cltp_val;
-static lv_obj_t* batt_bar;
-static lv_obj_t* batt_val;
+/* Pod widgets: each pod has a status dot, value label, and bar */
+typedef struct {
+    lv_obj_t* pod;    /* container */
+    lv_obj_t* dot;    /* status indicator */
+    lv_obj_t* val;    /* value label */
+    lv_obj_t* bar;    /* thin range bar */
+} gauge_pod_t;
+
+static gauge_pod_t pod_oilt, pod_oilp, pod_clt;
+static gauge_pod_t pod_lam, pod_cltp, pod_batt;
+
+/* Bottom readouts (remaining params without pods) */
 static lv_obj_t* lbl_lambda1;
 static lv_obj_t* lbl_lambda2;
 static lv_obj_t* lbl_iat;
@@ -98,73 +99,84 @@ static void init_section_styles(void)
     lv_style_set_line_color(&style_section_red_items, COL_RED);
 }
 
-/* Create a horizontal bar gauge row: "Label ████░░░░ value" */
-static void create_bar_row(lv_obj_t* parent, int32_t y_pos,
-    const char* name, int32_t min_val, int32_t max_val, int32_t init_val,
-    lv_color_t bar_color,
-    lv_obj_t** out_bar, lv_obj_t** out_val_label)
+/* Pod colors */
+#define COL_POD_BG      lv_color_hex(0x1c1c1e)
+#define COL_POD_BORDER  lv_color_hex(0x3a3a3c)
+#define POD_OPACITY     LV_OPA_COVER   /* change to LV_OPA_70 for glass effect */
+
+/**
+ * Create a gauge pod: opaque container with large value, label, thin bar, status dot.
+ *
+ *  ┌──────────────────┐
+ *  │  ●    92°C       │  ← dot + large value centered
+ *  │      OIL         │  ← small label
+ *  │  ▓▓▓▓▓▓▓▓░░░░░  │  ← thin bar
+ *  └──────────────────┘
+ */
+static void create_pod(lv_obj_t* parent, int32_t x, int32_t y, int32_t w, int32_t h,
+    const char* label_text, const char* init_val,
+    int32_t bar_min, int32_t bar_max, int32_t bar_init,
+    gauge_pod_t* out)
 {
-    /* Label on left */
-    lv_obj_t* lbl = lv_label_create(parent);
-    lv_label_set_text(lbl, name);
-    lv_obj_set_style_text_color(lbl, COL_TEXT_DIM, 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
-    lv_obj_set_pos(lbl, 185, y_pos + 2);
+    /* Container */
+    lv_obj_t* pod = lv_obj_create(parent);
+    lv_obj_set_pos(pod, x, y);
+    lv_obj_set_size(pod, w, h);
+    lv_obj_set_style_radius(pod, 12, 0);
+    lv_obj_set_style_bg_color(pod, COL_POD_BG, 0);
+    lv_obj_set_style_bg_opa(pod, POD_OPACITY, 0);
+    lv_obj_set_style_border_color(pod, COL_POD_BORDER, 0);
+    lv_obj_set_style_border_width(pod, 2, 0);
+    lv_obj_set_style_pad_all(pod, 0, 0);
+    lv_obj_set_scrollbar_mode(pod, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(pod, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(pod, LV_OBJ_FLAG_SCROLLABLE);
+    out->pod = pod;
+    out->dot = NULL;
 
-    /* Bar */
-    lv_obj_t* bar = lv_bar_create(parent);
-    lv_obj_set_size(bar, 300, 18);
-    lv_obj_set_pos(bar, 250, y_pos + 3);
-    lv_bar_set_range(bar, min_val, max_val);
-    lv_bar_set_value(bar, init_val, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(bar, COL_BAR_TRACK, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, bar_color, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
-    *out_bar = bar;
-
-    /* Value label on right */
-    lv_obj_t* val = lv_label_create(parent);
-    lv_label_set_text(val, "---");
+    /* Large value — centered */
+    lv_obj_t* val = lv_label_create(pod);
+    lv_label_set_text(val, init_val);
     lv_obj_set_style_text_color(val, COL_TEXT, 0);
-    lv_obj_set_style_text_font(val, &lv_font_montserrat_18, 0);
-    lv_obj_set_pos(val, 565, y_pos + 2);
-    *out_val_label = val;
+    lv_obj_set_style_text_font(val, &lv_font_montserrat_24, 0);
+    lv_obj_align(val, LV_ALIGN_TOP_MID, 0, 6);
+    out->val = val;
+
+    /* Small label below value — dimmer, smaller */
+    lv_obj_t* lbl = lv_label_create(pod);
+    lv_label_set_text(lbl, label_text);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0x6e7681), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+    /* Thin bar at bottom */
+    lv_obj_t* bar = lv_bar_create(pod);
+    lv_obj_set_size(bar, w - 20, 4);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_bar_set_range(bar, bar_min, bar_max);
+    lv_bar_set_value(bar, bar_init, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar, COL_ARC_TRACK, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, COL_NORMAL, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 2, LV_PART_INDICATOR);
+    out->bar = bar;
 }
 
-/* Create a smaller horizontal bar for the secondary gauges */
-static void create_small_bar_row(lv_obj_t* parent, int32_t y_pos,
-    const char* name, int32_t min_val, int32_t max_val, int32_t init_val,
-    lv_color_t bar_color,
-    lv_obj_t** out_bar, lv_obj_t** out_val_label)
+/* Update pod alert state: changes border, value text, bar, and dot color */
+static void pod_set_alert(gauge_pod_t* p, lv_color_t color)
 {
-    lv_obj_t* lbl = lv_label_create(parent);
-    lv_label_set_text(lbl, name);
-    lv_obj_set_style_text_color(lbl, COL_TEXT_DIM, 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(lbl, 195, y_pos + 1);
+    lv_obj_set_style_border_color(p->pod, color, 0);
+    lv_obj_set_style_text_color(p->val, color, 0);
+    lv_obj_set_style_bg_color(p->bar, color, LV_PART_INDICATOR);
+}
 
-    lv_obj_t* bar = lv_bar_create(parent);
-    lv_obj_set_size(bar, 280, 14);
-    lv_obj_set_pos(bar, 260, y_pos + 2);
-    lv_bar_set_range(bar, min_val, max_val);
-    lv_bar_set_value(bar, init_val, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(bar, COL_BAR_TRACK, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, bar_color, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
-    *out_bar = bar;
-
-    lv_obj_t* val = lv_label_create(parent);
-    lv_label_set_text(val, "---");
-    lv_obj_set_style_text_color(val, COL_TEXT, 0);
-    lv_obj_set_style_text_font(val, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(val, 555, y_pos + 1);
-    *out_val_label = val;
+static void pod_set_normal(gauge_pod_t* p)
+{
+    lv_obj_set_style_border_color(p->pod, COL_POD_BORDER, 0);
+    lv_obj_set_style_text_color(p->val, COL_TEXT, 0);
+    lv_obj_set_style_bg_color(p->bar, COL_NORMAL, LV_PART_INDICATOR);
 }
 
 /* Create a tiny label for the bottom readout row */
@@ -181,6 +193,11 @@ static lv_obj_t* create_readout(lv_obj_t* parent, int32_t x, int32_t y, const ch
 void golden_screen_set_tile_path(const char* path)
 {
     tile_path = path;
+}
+
+void golden_screen_set_alt_tile_path(const char* path)
+{
+    alt_tile_path = path;
 }
 
 /* ── Main screen builder ── */
@@ -297,6 +314,9 @@ void golden_screen_create(lv_obj_t* parent)
             map_renderer_set_view(gs_map, 45.00, 14.61, 13);
             map_renderer_set_vignette(gs_map, 0.65f, COL_BG);
             map_renderer_create_track_btn(gs_map, root, 220, 60);
+            if (alt_tile_path) {
+                map_renderer_set_alt_tiles(gs_map, alt_tile_path, root, -220, 60);
+            }
         }
     }
 
@@ -359,66 +379,56 @@ void golden_screen_create(lv_obj_t* parent)
     lv_obj_set_pos(watertemp_label, 145, 4);
 
     /* ════════════════════════════════════════════
-     *  Semi-transparent backdrop behind all bars — "frosted" overlay on chart
+     *  Gauge pods — Row 1: 3 pods (OilT, OilP, CltT)
+     *  145×58px each, 10px gaps, centered in 460px
      * ════════════════════════════════════════════ */
-    lv_obj_t* bar_backdrop = lv_obj_create(root);
-    lv_obj_set_size(bar_backdrop, 460, 180);
-    lv_obj_set_pos(bar_backdrop, (DISP_SIZE - 460) / 2, 530);
-    lv_obj_set_style_radius(bar_backdrop, 20, 0);
-    lv_obj_set_style_bg_color(bar_backdrop, COL_BG, 0);
-    lv_obj_set_style_bg_opa(bar_backdrop, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(bar_backdrop, 0, 0);
-    lv_obj_set_style_pad_all(bar_backdrop, 0, 0);
-    lv_obj_set_scrollbar_mode(bar_backdrop, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_remove_flag(bar_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    int32_t pod_w1 = 145, pod_h1 = 72, pod_gap = 10;
+    int32_t row1_total = pod_w1 * 3 + pod_gap * 2;
+    int32_t row1_x = (DISP_SIZE - row1_total) / 2;
+    int32_t row1_y = 545;
+
+    create_pod(root, row1_x,                      row1_y, pod_w1, pod_h1,
+        "OIL",   "92°C",  40, 150, 92,  &pod_oilt);
+    create_pod(root, row1_x + pod_w1 + pod_gap,   row1_y, pod_w1, pod_h1,
+        "PRESS", "4.2bar", 0, 600, 420, &pod_oilp);
+    create_pod(root, row1_x + (pod_w1 + pod_gap)*2, row1_y, pod_w1, pod_h1,
+        "CLT",   "72°C",  40, 110, 77,  &pod_clt);
 
     /* ════════════════════════════════════════════
-     *  Horizontal bar gauges — primary (OilT, OilP, CltT)
+     *  Gauge pods — Row 2: 3 pods (Lambda, CltP, Batt)
+     *  130×55px each, narrower to follow circle curve
      * ════════════════════════════════════════════ */
-    int32_t bar_y = 540;
-    int32_t bar_sp = 30;
+    int32_t pod_w2 = 130, pod_h2 = 68;
+    int32_t row2_total = pod_w2 * 3 + pod_gap * 2;
+    int32_t row2_x = (DISP_SIZE - row2_total) / 2;
+    int32_t row2_y = row1_y + pod_h1 + pod_gap;
 
-    create_bar_row(root, bar_y,
-        "OilT", 40, 150, 92, COL_NORMAL, &oilt_bar, &oilt_val);
-    create_bar_row(root, bar_y + bar_sp,
-        "OilP", 0, 600, 420, COL_NORMAL, &oilp_bar, &oilp_val);
-    create_bar_row(root, bar_y + bar_sp * 2,
-        "CltT", 40, 110, 77, COL_NORMAL, &clt_bar, &clt_val);
-
-    /* ════════════════════════════════════════════
-     *  Horizontal bar gauges — secondary (Lambda, CltP, BattV)
-     *  Slightly smaller, fitting between the "0" and "6" scale marks.
-     * ════════════════════════════════════════════ */
-    int32_t sbar_y = bar_y + bar_sp * 3 + 4;
-    int32_t sbar_sp = 24;
-
-    create_small_bar_row(root, sbar_y,
-        "Lam", 70, 130, 100, COL_NORMAL, &lambda_bar, &lambda_val);
-    create_small_bar_row(root, sbar_y + sbar_sp,
-        "CltP", 0, 100, 55, COL_NORMAL, &cltp_bar, &cltp_val);
-    create_small_bar_row(root, sbar_y + sbar_sp * 2,
-        "Batt", 110, 150, 141, COL_NORMAL, &batt_bar, &batt_val);
+    create_pod(root, row2_x,                      row2_y, pod_w2, pod_h2,
+        "LAM",  "1.00",   70, 130, 100, &pod_lam);
+    create_pod(root, row2_x + pod_w2 + pod_gap,   row2_y, pod_w2, pod_h2,
+        "CP",   "55kPa",  0,  100, 55,  &pod_cltp);
+    create_pod(root, row2_x + (pod_w2 + pod_gap)*2, row2_y, pod_w2, pod_h2,
+        "BAT",  "14.1V",  110, 150, 141, &pod_batt);
 
     /* ════════════════════════════════════════════
      *  Bottom digital readouts
      *  Row 1: L1, L2, IAT, MAP (4 items)
      *  Row 2: FP, FC (2 items, centered lower in the circle)
      * ════════════════════════════════════════════ */
-    int32_t row1_y = 715;
-    int32_t row2_y = 740;
+    int32_t rdout1_y = row2_y + pod_h2 + 12;
+    int32_t rdout2_y = rdout1_y + 22;
     int32_t col_w = 85;
 
-    int32_t row1_start = (DISP_SIZE - col_w * 4) / 2;
-    lbl_lambda1 = create_readout(root, row1_start,             row1_y, "L1 ---");
-    lbl_lambda2 = create_readout(root, row1_start + col_w,     row1_y, "L2 ---");
-    lbl_iat     = create_readout(root, row1_start + col_w * 2, row1_y, "IAT ---");
-    lbl_map     = create_readout(root, row1_start + col_w * 3, row1_y, "MAP ---");
+    int32_t rdout1_start = (DISP_SIZE - col_w * 4) / 2;
+    lbl_lambda1 = create_readout(root, rdout1_start,             rdout1_y, "L1 ---");
+    lbl_lambda2 = create_readout(root, rdout1_start + col_w,     rdout1_y, "L2 ---");
+    lbl_iat     = create_readout(root, rdout1_start + col_w * 2, rdout1_y, "IAT ---");
+    lbl_map     = create_readout(root, rdout1_start + col_w * 3, rdout1_y, "MAP ---");
 
-    /* Row 2: 2 items, wider spacing, centered lower in the circle */
-    int32_t row2_w = 130;
-    int32_t row2_start = (DISP_SIZE - row2_w * 2) / 2;
-    lbl_fp      = create_readout(root, row2_start,          row2_y, "FP ---");
-    lbl_fuel    = create_readout(root, row2_start + row2_w, row2_y, "FC ---");
+    int32_t rdout2_w = 130;
+    int32_t rdout2_start = (DISP_SIZE - rdout2_w * 2) / 2;
+    lbl_fp      = create_readout(root, rdout2_start,          rdout2_y, "FP ---");
+    lbl_fuel    = create_readout(root, rdout2_start + rdout2_w, rdout2_y, "FC ---");
 }
 
 /* ════════════════════════════════════════════
@@ -452,55 +462,56 @@ void golden_screen_update(const gauge_data_t* d)
     snprintf(buf, sizeof(buf), "%.0f°C", d->water_temp_c);
     lv_label_set_text(watertemp_label, buf);
 
-    /* Oil temp bar */
-    lv_bar_set_value(oilt_bar, (int32_t)d->oil_temp_c, LV_ANIM_ON);
+    /* ── Pod updates with alert system ── */
+
+    /* Oil temp pod */
+    lv_bar_set_value(pod_oilt.bar, (int32_t)d->oil_temp_c, LV_ANIM_ON);
     snprintf(buf, sizeof(buf), "%.0f°C", d->oil_temp_c);
-    lv_label_set_text(oilt_val, buf);
-    lv_obj_set_style_bg_color(oilt_bar,
-        d->oil_temp_c > 125 ? COL_RED : (d->oil_temp_c > 110 ? COL_YELLOW : COL_NORMAL),
-        LV_PART_INDICATOR);
+    lv_label_set_text(pod_oilt.val, buf);
+    if (d->oil_temp_c > 125)      pod_set_alert(&pod_oilt, COL_RED);
+    else if (d->oil_temp_c > 110)  pod_set_alert(&pod_oilt, COL_YELLOW);
+    else                           pod_set_normal(&pod_oilt);
 
-    /* Oil pressure bar (kPa, display as bar: 1 bar = 100 kPa) */
-    lv_bar_set_value(oilp_bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.1fbar", d->oil_pressure_kpa / 100.0f);
-    lv_label_set_text(oilp_val, buf);
-    lv_obj_set_style_bg_color(oilp_bar,
-        d->oil_pressure_kpa < 150 ? COL_RED : (d->oil_pressure_kpa < 250 ? COL_YELLOW : COL_NORMAL),
-        LV_PART_INDICATOR);
+    /* Oil pressure pod */
+    lv_bar_set_value(pod_oilp.bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_ON);
+    snprintf(buf, sizeof(buf), "%.1f", d->oil_pressure_kpa / 100.0f);
+    lv_label_set_text(pod_oilp.val, buf);
+    if (d->oil_pressure_kpa < 150)       pod_set_alert(&pod_oilp, COL_RED);
+    else if (d->oil_pressure_kpa < 250)  pod_set_alert(&pod_oilp, COL_YELLOW);
+    else                                 pod_set_normal(&pod_oilp);
 
-    /* Coolant temp bar */
-    lv_bar_set_value(clt_bar, (int32_t)d->coolant_temp_c, LV_ANIM_ON);
+    /* Coolant temp pod */
+    lv_bar_set_value(pod_clt.bar, (int32_t)d->coolant_temp_c, LV_ANIM_ON);
     snprintf(buf, sizeof(buf), "%.0f°C", d->coolant_temp_c);
-    lv_label_set_text(clt_val, buf);
-    lv_obj_set_style_bg_color(clt_bar,
-        d->coolant_temp_c > 77 ? COL_RED : (d->coolant_temp_c > 70 ? COL_YELLOW : COL_NORMAL),
-        LV_PART_INDICATOR);
+    lv_label_set_text(pod_clt.val, buf);
+    if (d->coolant_temp_c > 77)       pod_set_alert(&pod_clt, COL_RED);
+    else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
+    else                              pod_set_normal(&pod_clt);
 
-    /* Lambda bar — show worst (leanest) of both banks, scale ×100 for bar range */
+    /* Lambda pod — worst (leanest) of both banks */
     float worst_lambda = d->lambda1 > d->lambda2 ? d->lambda1 : d->lambda2;
-    lv_bar_set_value(lambda_bar, (int32_t)(worst_lambda * 100), LV_ANIM_ON);
+    lv_bar_set_value(pod_lam.bar, (int32_t)(worst_lambda * 100), LV_ANIM_ON);
     snprintf(buf, sizeof(buf), "%.2f", worst_lambda);
-    lv_label_set_text(lambda_val, buf);
-    lv_obj_set_style_bg_color(lambda_bar,
-        (worst_lambda < 0.85f || worst_lambda > 1.15f) ? COL_RED :
-        (worst_lambda < 0.90f || worst_lambda > 1.10f) ? COL_YELLOW : COL_NORMAL,
-        LV_PART_INDICATOR);
+    lv_label_set_text(pod_lam.val, buf);
+    if (worst_lambda < 0.85f || worst_lambda > 1.15f)       pod_set_alert(&pod_lam, COL_RED);
+    else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
+    else                                                    pod_set_normal(&pod_lam);
 
-    /* Coolant pressure bar */
-    lv_bar_set_value(cltp_bar, (int32_t)d->coolant_pressure_kpa, LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.0fkPa", d->coolant_pressure_kpa);
-    lv_label_set_text(cltp_val, buf);
-    lv_obj_set_style_bg_color(cltp_bar,
-        d->coolant_pressure_kpa < 15 ? COL_RED : (d->coolant_pressure_kpa < 25 ? COL_YELLOW : COL_NORMAL),
-        LV_PART_INDICATOR);
+    /* Coolant pressure pod */
+    lv_bar_set_value(pod_cltp.bar, (int32_t)d->coolant_pressure_kpa, LV_ANIM_ON);
+    snprintf(buf, sizeof(buf), "%.0f", d->coolant_pressure_kpa);
+    lv_label_set_text(pod_cltp.val, buf);
+    if (d->coolant_pressure_kpa < 15)       pod_set_alert(&pod_cltp, COL_RED);
+    else if (d->coolant_pressure_kpa < 25)  pod_set_alert(&pod_cltp, COL_YELLOW);
+    else                                    pod_set_normal(&pod_cltp);
 
-    /* Battery voltage bar (range 11.0-15.0V, displayed as 110-150 in bar) */
-    lv_bar_set_value(batt_bar, (int32_t)(d->battery_voltage * 10), LV_ANIM_ON);
+    /* Battery voltage pod */
+    lv_bar_set_value(pod_batt.bar, (int32_t)(d->battery_voltage * 10), LV_ANIM_ON);
     snprintf(buf, sizeof(buf), "%.1fV", d->battery_voltage);
-    lv_label_set_text(batt_val, buf);
-    lv_obj_set_style_bg_color(batt_bar,
-        d->battery_voltage < 12.0f ? COL_RED : (d->battery_voltage < 12.8f ? COL_YELLOW : COL_NORMAL),
-        LV_PART_INDICATOR);
+    lv_label_set_text(pod_batt.val, buf);
+    if (d->battery_voltage < 12.0f)       pod_set_alert(&pod_batt, COL_RED);
+    else if (d->battery_voltage < 12.8f)  pod_set_alert(&pod_batt, COL_YELLOW);
+    else                                  pod_set_normal(&pod_batt);
 
     /* Bottom digital readouts — "KEY value unit" format */
     snprintf(buf, sizeof(buf), "L1 %.2f", d->lambda1);

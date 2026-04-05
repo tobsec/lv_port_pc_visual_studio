@@ -13,6 +13,7 @@ extern "C" {
  * ESP32:     "S:/MAP_BIN" (SD card)
  * Tiles at: {base}/{z}/{x}/{y}.bin (raw RGB565, 256x256) */
 void golden_screen_set_tile_path(const char* path);
+void golden_screen_set_alt_tile_path(const char* path);
 
 /* Create the golden main screen.
  * @param parent  Container to build in (tileview tile or screen root).

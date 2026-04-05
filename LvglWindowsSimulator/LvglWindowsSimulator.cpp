@@ -191,6 +191,7 @@ int main()
     /* Initialize simulated data and create all screens */
     sim_data_init();
     screen_manager_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
+    screen_manager_set_alt_tile_path("C:/Data/marine-gauge/tools/MAP_DARK");
     screen_manager_create();
     screen_manager_update(&sim_data);
 
