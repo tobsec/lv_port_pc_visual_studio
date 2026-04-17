@@ -1,6 +1,8 @@
 #include "screen_manager.h"
 #include "golden_screen.h"
 #include "map_renderer.h"
+#include "tile_cache.h"
+#include "warning_overlay.h"
 #include <stdio.h>
 
 #define DISP_SIZE 800
@@ -15,7 +17,11 @@ static const char* tile_path = NULL;
 static const char* alt_tile_path = NULL;
 static lv_obj_t* tileview;
 static int32_t current_screen = 0;
+static bool swiping = false;       /* true during tileview scroll animation */
 #define NUM_SCREENS 3
+
+/* Shared tile cache for all map renderers */
+static tile_cache_t* g_tile_cache = NULL;
 
 /* Screen 2 widgets */
 static map_renderer_t* s2_map = NULL;
@@ -147,6 +153,37 @@ static void create_screen3(lv_obj_t* tile)
     s3_hours_label = create_big_value(tile, col2, row_start + row_h * 5,  "Engine Hours", "---");
 }
 
+/* Tileview scroll events — freeze updates during swipe transitions */
+static void tileview_scroll_begin_cb(lv_event_t* e)
+{
+    (void)e;
+    swiping = true;
+}
+
+static void tileview_scroll_end_cb(lv_event_t* e)
+{
+    (void)e;
+    swiping = false;
+    /* Update current_screen from the tileview's active tile */
+    lv_obj_t* active = lv_tileview_get_tile_active(tileview);
+    if (active) {
+        int32_t col = lv_obj_get_x(active) / DISP_SIZE;
+        if (col >= 0 && col < NUM_SCREENS) current_screen = col;
+    }
+}
+
+/* Tile-ready timer: polls for background tile loads, re-renders maps */
+static void tile_ready_timer_cb(lv_timer_t* timer)
+{
+    (void)timer;
+    if (swiping || !g_tile_cache || !tile_cache_check_ready(g_tile_cache)) return;
+    if (current_screen == 0) {
+        map_renderer_t* gs_map = golden_screen_get_map();
+        if (gs_map) map_renderer_render(gs_map);
+    }
+    if (current_screen == 1 && s2_map) map_renderer_render(s2_map);
+}
+
 /* ── Public API ── */
 
 void screen_manager_set_tile_path(const char* path)
@@ -185,6 +222,10 @@ void screen_manager_create(void)
     lv_obj_set_style_bg_opa(tileview, LV_OPA_TRANSP, 0);
     lv_obj_set_scrollbar_mode(tileview, LV_SCROLLBAR_MODE_OFF);
 
+    /* Detect swipe transitions to freeze updates */
+    lv_obj_add_event_cb(tileview, tileview_scroll_begin_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(tileview, tileview_scroll_end_cb, LV_EVENT_SCROLL_END, NULL);
+
     /* Tile 0: Golden screen (main) */
     lv_obj_t* t0 = lv_tileview_add_tile(tileview, 0, 0, LV_DIR_RIGHT);
     golden_screen_create(t0);
@@ -196,71 +237,113 @@ void screen_manager_create(void)
     /* Tile 2: Engine detail */
     lv_obj_t* t2 = lv_tileview_add_tile(tileview, 2, 0, LV_DIR_LEFT);
     create_screen3(t2);
+
+    /* Warning overlay — sibling of tileview, inside circle mask, on top of everything */
+    warning_overlay_init(circle);
+
+    /* Debug tick counter — on top of everything */
+    golden_screen_show_tick_counter(circle);
+
+    /* Create shared tile cache and attach to map renderers */
+    if (tile_path) {
+        g_tile_cache = tile_cache_create(64);  /* 64 tiles × 128 KB = 8 MB */
+        if (g_tile_cache) {
+            map_renderer_t* gs_map = golden_screen_get_map();
+            if (gs_map) map_renderer_set_cache(gs_map, g_tile_cache);
+            if (s2_map) map_renderer_set_cache(s2_map, g_tile_cache);
+            tile_cache_start_loader(g_tile_cache);
+            lv_timer_create(tile_ready_timer_cb, 500, NULL);  /* 2 Hz poll */
+        }
+    }
 }
 
 void screen_manager_update(const gauge_data_t* d)
 {
+    /* Debug tick counter — always increments to show data liveness */
+    golden_screen_update_tick();
+
+    /* Freeze all updates during swipe transition */
+    if (swiping) return;
+
     char buf[32];
 
-    /* Update golden screen (Screen 1) */
-    golden_screen_update(d);
+    /* Warning overlay — always active regardless of screen */
+    warning_overlay_update(d);
 
-    /* Update Screen 2: map position + SOG/COG overlay */
-    /* Only update screen 2 map when visible, throttled to ~2Hz */
-    static uint32_t s2_map_frame = 0;
-    if (current_screen == 1 && ++s2_map_frame >= 10) {
-        s2_map_frame = 0;
-        if (s2_map && d->latitude != 0.0 && d->longitude != 0.0) {
-            map_renderer_set_position(s2_map, d->latitude, d->longitude, d->cog_degrees);
+    /* Screen 0: Golden gauge (comet + map + pods) — only when visible */
+    if (current_screen == 0)
+        golden_screen_update(d);
+
+    /* Screen 1: Full-size map + SOG/COG overlay */
+    if (current_screen == 1) {
+        static uint32_t s2_map_frame = 0;
+        if (++s2_map_frame >= 40) {
+            s2_map_frame = 0;
+            if (s2_map && d->latitude != 0.0 && d->longitude != 0.0) {
+                map_renderer_set_position(s2_map, d->latitude, d->longitude, d->cog_degrees);
+            }
+        }
+        static uint32_t s2_label_frame = 0;
+        if (++s2_label_frame >= 5) {
+            s2_label_frame = 0;
+            snprintf(buf, sizeof(buf), "%.1f kn", d->sog_knots);
+            lv_label_set_text(s2_sog_label, buf);
+            snprintf(buf, sizeof(buf), "%.0f°", d->cog_degrees);
+            lv_label_set_text(s2_cog_label, buf);
         }
     }
-    snprintf(buf, sizeof(buf), "%.1f kn", d->sog_knots);
-    lv_label_set_text(s2_sog_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f°", d->cog_degrees);
-    lv_label_set_text(s2_cog_label, buf);
 
-    /* Update Screen 3: Engine detail */
-    snprintf(buf, sizeof(buf), "%d RPM", (int)d->rpm);
-    lv_label_set_text(s3_rpm_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f°C", d->oil_temp_c);
-    lv_label_set_text(s3_oilt_label, buf);
-    snprintf(buf, sizeof(buf), "%.1f bar", d->oil_pressure_kpa / 100.0f);
-    lv_label_set_text(s3_oilp_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f°C", d->coolant_temp_c);
-    lv_label_set_text(s3_clt_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f°C", d->iat_c);
-    lv_label_set_text(s3_iat_label, buf);
-    snprintf(buf, sizeof(buf), "%.3f", d->lambda1);
-    lv_label_set_text(s3_lambda1_label, buf);
-    snprintf(buf, sizeof(buf), "%.3f", d->lambda2);
-    lv_label_set_text(s3_lambda2_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f kPa", d->map_kpa);
-    lv_label_set_text(s3_map_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f kPa", d->fuel_pressure_kpa);
-    lv_label_set_text(s3_fp_label, buf);
-    snprintf(buf, sizeof(buf), "%.1fV", d->battery_voltage);
-    lv_label_set_text(s3_batt_label, buf);
-    snprintf(buf, sizeof(buf), "%.1f l/h", d->fuel_rate_lph);
-    lv_label_set_text(s3_fuel_label, buf);
-    snprintf(buf, sizeof(buf), "%.0f kPa", d->coolant_pressure_kpa);
-    lv_label_set_text(s3_cltp_label, buf);
-    snprintf(buf, sizeof(buf), "%dh", d->engine_hours_s / 3600);
-    lv_label_set_text(s3_hours_label, buf);
+    /* Screen 2: Engine detail labels */
+    if (current_screen == 2) {
+        static uint32_t s3_frame = 0;
+        if (++s3_frame < 2) goto s3_skip;  /* ~10Hz at 20Hz input */
+        s3_frame = 0;
+
+        snprintf(buf, sizeof(buf), "%d RPM", (int)d->rpm);
+        lv_label_set_text(s3_rpm_label, buf);
+        snprintf(buf, sizeof(buf), "%.0f°C", d->oil_temp_c);
+        lv_label_set_text(s3_oilt_label, buf);
+        snprintf(buf, sizeof(buf), "%.1f bar", d->oil_pressure_kpa / 100.0f);
+        lv_label_set_text(s3_oilp_label, buf);
+        snprintf(buf, sizeof(buf), "%.0f°C", d->coolant_temp_c);
+        lv_label_set_text(s3_clt_label, buf);
+        snprintf(buf, sizeof(buf), "%.0f°C", d->iat_c);
+        lv_label_set_text(s3_iat_label, buf);
+        snprintf(buf, sizeof(buf), "%.3f", d->lambda1);
+        lv_label_set_text(s3_lambda1_label, buf);
+        snprintf(buf, sizeof(buf), "%.3f", d->lambda2);
+        lv_label_set_text(s3_lambda2_label, buf);
+        snprintf(buf, sizeof(buf), "%.0f kPa", d->map_kpa);
+        lv_label_set_text(s3_map_label, buf);
+        snprintf(buf, sizeof(buf), "%.0f kPa", d->fuel_pressure_kpa);
+        lv_label_set_text(s3_fp_label, buf);
+        snprintf(buf, sizeof(buf), "%.1fV", d->battery_voltage);
+        lv_label_set_text(s3_batt_label, buf);
+        snprintf(buf, sizeof(buf), "%.1f l/h", d->fuel_rate_lph);
+        lv_label_set_text(s3_fuel_label, buf);
+        snprintf(buf, sizeof(buf), "%.0f kPa", d->coolant_pressure_kpa);
+        lv_label_set_text(s3_cltp_label, buf);
+        snprintf(buf, sizeof(buf), "%luh", (unsigned long)(d->engine_hours_s / 3600));
+        lv_label_set_text(s3_hours_label, buf);
+        s3_skip:;
+    }
 }
 
 void screen_manager_next(void)
 {
     if (current_screen < NUM_SCREENS - 1) {
-        current_screen++;
-        lv_tileview_set_tile_by_index(tileview, current_screen, 0, LV_ANIM_ON);
+        /* Don't update current_screen here — scroll_end callback handles it.
+         * This prevents the destination screen from rendering during the animation. */
+        swiping = true;
+        lv_tileview_set_tile_by_index(tileview, current_screen + 1, 0, LV_ANIM_ON);
     }
 }
 
 void screen_manager_prev(void)
 {
     if (current_screen > 0) {
-        current_screen--;
-        lv_tileview_set_tile_by_index(tileview, current_screen, 0, LV_ANIM_ON);
+        swiping = true;
+        lv_tileview_set_tile_by_index(tileview, current_screen - 1, 0, LV_ANIM_ON);
     }
 }
 

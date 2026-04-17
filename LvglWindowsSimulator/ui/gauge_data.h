@@ -44,7 +44,8 @@ typedef struct {
 
     /* Metadata */
     uint32_t last_update_ms;
-    bool can_active;
+    bool engine_can_active;  /* rusEFI ECU messages received within 2s */
+    bool nav_can_active;     /* Raymarine a78 messages received within 2s */
 } gauge_data_t;
 
 #ifdef __cplusplus

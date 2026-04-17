@@ -26,6 +26,10 @@ void golden_screen_update(const gauge_data_t* data);
 /* Get the map renderer instance (for zoom control from simulator) */
 struct map_renderer* golden_screen_get_map(void);
 
+/* Debug: show a frame tick counter to distinguish data stall from render lag */
+void golden_screen_show_tick_counter(lv_obj_t* parent);
+void golden_screen_update_tick(void);
+
 #ifdef __cplusplus
 }
 #endif

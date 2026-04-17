@@ -8,6 +8,10 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* Define COMET_DISABLE to replace the expensive canvas comet with a
+ * lightweight LVGL arc needle — useful for performance profiling. */
+/* #define COMET_DISABLE */  /* uncomment to use ring-band needle instead of comet canvas */
+
 /* ── Layout constants ── */
 #define DISP_SIZE       800
 #define RPM_SCALE_SIZE  780
@@ -17,7 +21,6 @@
 
 /* Comet tail gauge constants */
 #define COMET_SIZE         780
-#define COMET_SEGMENTS     20
 #define COMET_NEEDLE_WIDTH 5      /* core needle thickness */
 #define COMET_GLOW_WIDTH   14     /* glow halo thickness (each side of needle) */
 #define COMET_RADIUS_OUTER 378    /* outer end (near scale ticks) */
@@ -44,10 +47,16 @@ static map_renderer_t* gs_map = NULL;
 
 /* ── Widget handles for update ── */
 static lv_obj_t* rpm_scale;
+#ifdef COMET_DISABLE
+static lv_obj_t* needle_line;       /* standalone lv_line in the ring band */
+static lv_point_precise_t needle_pts[2];  /* persistent — lv_line stores the pointer */
+#else
 static lv_obj_t* comet_canvas;
 static uint16_t* comet_buf;
 static int32_t   comet_last_rpm = -1;
 static lv_area_t comet_dirty;       /* bounding box of last drawn comet */
+static lv_draw_buf_t* scale_overlay; /* pre-rendered scale ticks/labels (ARGB8888) */
+#endif
 
 /* Comet colors */
 #define COL_COMET_BLUE   lv_color_hex(0x4488ff)
@@ -110,6 +119,7 @@ static void init_section_styles(void)
 
     lv_style_init(&style_section_yellow_indicator);
     lv_style_set_line_color(&style_section_yellow_indicator, COL_YELLOW);
+    lv_style_set_text_color(&style_section_yellow_indicator, COL_YELLOW);
 
     lv_style_init(&style_section_yellow_items);
     lv_style_set_line_color(&style_section_yellow_items, COL_YELLOW);
@@ -120,11 +130,13 @@ static void init_section_styles(void)
 
     lv_style_init(&style_section_red_indicator);
     lv_style_set_line_color(&style_section_red_indicator, COL_RED);
+    lv_style_set_text_color(&style_section_red_indicator, COL_RED);
 
     lv_style_init(&style_section_red_items);
     lv_style_set_line_color(&style_section_red_items, COL_RED);
 }
 
+#ifndef COMET_DISABLE
 /* ── Comet tail helpers ── */
 
 static uint16_t color_to_565(lv_color_t c)
@@ -178,8 +190,60 @@ static void clear_last_comet(void)
     }
 }
 
+/* Overlay pre-rendered scale ticks/labels from ARGB8888 snapshot onto
+ * the comet canvas.  Called after comet drawing to restore scale pixels
+ * that were cleared or overwritten by the comet gradient. */
+static void overlay_scale(lv_area_t* area)
+{
+    if (!scale_overlay || !scale_overlay->data) return;
+    const uint8_t* src = scale_overlay->data;
+    uint32_t stride = scale_overlay->header.stride;
+    int32_t snap_w = scale_overlay->header.w;
+    int32_t snap_h = scale_overlay->header.h;
+
+    /* Center the snapshot within the canvas (may differ by padding) */
+    int32_t off_x = (COMET_SIZE - snap_w) / 2;
+    int32_t off_y = (COMET_SIZE - snap_h) / 2;
+
+    int32_t x1 = area->x1 < 0 ? 0 : area->x1;
+    int32_t y1 = area->y1 < 0 ? 0 : area->y1;
+    int32_t x2 = area->x2 >= COMET_SIZE ? COMET_SIZE - 1 : area->x2;
+    int32_t y2 = area->y2 >= COMET_SIZE ? COMET_SIZE - 1 : area->y2;
+
+    for (int32_t y = y1; y <= y2; y++) {
+        int32_t sy = y - off_y;
+        if (sy < 0 || sy >= snap_h) continue;
+        const uint8_t* row = src + sy * stride;
+        for (int32_t x = x1; x <= x2; x++) {
+            int32_t sx = x - off_x;
+            if (sx < 0 || sx >= snap_w) continue;
+            const uint8_t* px = row + sx * 4;  /* BGRA in memory */
+            uint8_t alpha = px[3];
+            if (alpha == 0) continue;
+
+            if (alpha >= 250) {
+                /* Opaque: direct conversion RGB888 → RGB565 */
+                comet_buf[y * COMET_SIZE + x] =
+                    ((px[2] >> 3) << 11) | ((px[1] >> 2) << 5) | (px[0] >> 3);
+            } else {
+                /* Semi-transparent: alpha blend onto canvas pixel */
+                uint16_t dst = comet_buf[y * COMET_SIZE + x];
+                uint32_t inv = 255 - alpha;
+                uint32_t r = (px[2] * alpha + (((dst >> 11) & 0x1F) << 3) * inv) / 255;
+                uint32_t g = (px[1] * alpha + (((dst >> 5) & 0x3F) << 2) * inv) / 255;
+                uint32_t b = (px[0] * alpha + ((dst & 0x1F) << 3) * inv) / 255;
+                comet_buf[y * COMET_SIZE + x] =
+                    ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            }
+        }
+    }
+}
+
 static void comet_redraw(float rpm)
 {
+    /* Save the old dirty rect before clearing — we need to invalidate it too */
+    lv_area_t old_dirty = comet_dirty;
+
     /* Clear previous frame's dirty area */
     clear_last_comet();
 
@@ -190,7 +254,18 @@ static void comet_redraw(float rpm)
     comet_dirty.y2 = 0;
 
     if (rpm < 50.0f) {
-        lv_obj_invalidate(comet_canvas);
+        /* Invalidate the old (now cleared) area, restore scale pixels */
+        if (old_dirty.x2 > old_dirty.x1) {
+            overlay_scale(&old_dirty);
+            lv_area_t screen_area;
+            int32_t ox = lv_obj_get_x(comet_canvas);
+            int32_t oy = lv_obj_get_y(comet_canvas);
+            screen_area.x1 = old_dirty.x1 + ox;
+            screen_area.y1 = old_dirty.y1 + oy;
+            screen_area.x2 = old_dirty.x2 + ox;
+            screen_area.y2 = old_dirty.y2 + oy;
+            lv_obj_invalidate_area(comet_canvas, &screen_area);
+        }
         return;
     }
 
@@ -200,16 +275,12 @@ static void comet_redraw(float rpm)
 
     /* Dark blue tail color */
     lv_color_t tail_color = lv_color_hex(0x112244);
-    float seg_span = COMET_SWEEP_DEG / COMET_SEGMENTS;
-
     /* Single continuous comet arc with per-pixel angular gradient.
      * Instead of discrete segments, draw one arc from tail to head
      * and compute opacity per pixel based on angular distance from head. */
     {
         float tail_angle = head_angle - COMET_SWEEP_DEG;
         if (tail_angle < 135.0f) tail_angle = 135.0f;  /* clamp to 0 RPM position */
-        float actual_sweep = head_angle - tail_angle;
-        if (actual_sweep < 1.0f) actual_sweep = 1.0f;
 
         int32_t cx = COMET_SIZE / 2;
         int32_t cy = COMET_SIZE / 2;
@@ -241,7 +312,6 @@ static void comet_redraw(float rpm)
          * boundary" the pixel is. Similarly cross_from_head = |Vh x P| tells us
          * how far before the head. The ratio cross_tail / (cross_tail + cross_from_head)
          * gives a smooth 0→1 interpolant across the sweep. */
-        float inv_sweep = 1.0f / actual_sweep;
 
         /* Compute tight bounding box from arc geometry */
         float a_mid = (a_tail + a_head) * 0.5f;
@@ -252,12 +322,12 @@ static void comet_redraw(float rpm)
         for (int i = 0; i < 5; i++) {
             int32_t sx = cx + (int32_t)(COMET_RADIUS_OUTER * cosf(sample_angles[i]));
             int32_t sy = cy + (int32_t)(COMET_RADIUS_OUTER * sinf(sample_angles[i]));
-            if (sx < bb_x1) bb_x1 = sx; if (sx > bb_x2) bb_x2 = sx;
-            if (sy < bb_y1) bb_y1 = sy; if (sy > bb_y2) bb_y2 = sy;
+            if (sx < bb_x1) { bb_x1 = sx; } if (sx > bb_x2) { bb_x2 = sx; }
+            if (sy < bb_y1) { bb_y1 = sy; } if (sy > bb_y2) { bb_y2 = sy; }
             sx = cx + (int32_t)(COMET_RADIUS_INNER * cosf(sample_angles[i]));
             sy = cy + (int32_t)(COMET_RADIUS_INNER * sinf(sample_angles[i]));
-            if (sx < bb_x1) bb_x1 = sx; if (sx > bb_x2) bb_x2 = sx;
-            if (sy < bb_y1) bb_y1 = sy; if (sy > bb_y2) bb_y2 = sy;
+            if (sx < bb_x1) { bb_x1 = sx; } if (sx > bb_x2) { bb_x2 = sx; }
+            if (sy < bb_y1) { bb_y1 = sy; } if (sy > bb_y2) { bb_y2 = sy; }
         }
         /* Add margin for the ring width */
         bb_x1 -= 2; bb_y1 -= 2; bb_x2 += 2; bb_y2 += 2;
@@ -266,52 +336,114 @@ static void comet_redraw(float rpm)
         if (bb_x2 >= COMET_SIZE) bb_x2 = COMET_SIZE - 1;
         if (bb_y2 >= COMET_SIZE) bb_y2 = COMET_SIZE - 1;
 
+        /* Scanline ring iteration — compute exact ring x-ranges per row
+         * to skip all pixels inside the inner circle.  Cross products use
+         * incremental adds (ct -= sin_tail, ch += sin_head) instead of
+         * per-pixel multiplies.  Dirty rect tracked per row, not per pixel. */
         for (int32_t y = bb_y1; y <= bb_y2; y++) {
             int32_t dy = y - cy;
             int32_t dy2 = dy * dy;
+            if (dy2 > r2_outer) continue;
 
-            for (int32_t x = bb_x1; x <= bb_x2; x++) {
-                int32_t dx = x - cx;
-                int32_t d2 = dx * dx + dy2;
-                if (d2 < r2_inner || d2 > r2_outer) continue;
+            /* Ring x-extent for this scanline */
+            int32_t rem_o = r2_outer - dy2;
+            int32_t x_outer = (int32_t)sqrtf((float)rem_o);
+            if (x_outer * x_outer > rem_o) x_outer--;
+            else if ((x_outer + 1) * (x_outer + 1) <= rem_o) x_outer++;
 
-                /* Cross-product angular test */
-                float ct = cos_tail * (float)dy - sin_tail * (float)dx;
-                float ch = (float)dx * sin_head - (float)dy * cos_head;
-                if (ct < 0.0f || ch < 0.0f) continue;
+            int32_t seg_x1[2], seg_x2[2];
+            int nseg;
+            if (dy2 < r2_inner) {
+                /* Row crosses inner hole — two ring segments */
+                int32_t rem_i = r2_inner - dy2;
+                int32_t x_inner = (int32_t)sqrtf((float)rem_i);
+                if (x_inner * x_inner < rem_i) x_inner++;
+                seg_x1[0] = cx - x_outer; seg_x2[0] = cx - x_inner;
+                seg_x1[1] = cx + x_inner; seg_x2[1] = cx + x_outer;
+                nseg = 2;
+            } else {
+                /* Row at or past inner edge — one continuous span */
+                seg_x1[0] = cx - x_outer; seg_x2[0] = cx + x_outer;
+                nseg = 1;
+            }
 
-                /* Angular interpolant: 0=tail, 1=head */
-                float t = ct / (ct + ch);
+            /* Per-row cross-product base values */
+            float ct_row = cos_tail * (float)dy;
+            float ch_row = -(float)dy * cos_head;
+            int32_t row_x_min = COMET_SIZE, row_x_max = 0;
+            uint16_t* row_ptr = &comet_buf[y * COMET_SIZE];
 
-                /* Opacity: quadratic ramp */
-                uint32_t alpha = (uint32_t)(255.0f * t * t);
+            for (int s = 0; s < nseg; s++) {
+                int32_t x1 = seg_x1[s] < bb_x1 ? bb_x1 : seg_x1[s];
+                int32_t x2 = seg_x2[s] > bb_x2 ? bb_x2 : seg_x2[s];
+                if (x1 > x2) continue;
 
-                /* Color lerp in RGB565 space */
-                uint32_t t256 = (uint32_t)(t * 256);
-                uint32_t it256 = 256 - t256;
-                uint32_t cr = (tail_r * it256 + head_r * t256) >> 8;
-                uint32_t cg = (tail_g * it256 + head_g * t256) >> 8;
-                uint32_t cb = (tail_b * it256 + head_b * t256) >> 8;
+                /* Seed cross products at x1, then increment per step */
+                float dx0 = (float)(x1 - cx);
+                float ct = ct_row - sin_tail * dx0;
+                float ch = ch_row + sin_head * dx0;
 
-                /* Blend with background */
-                uint32_t inv = 255 - alpha;
-                uint32_t r = (cr * alpha + bg_r * inv) >> 8;
-                uint32_t g = (cg * alpha + bg_g * inv) >> 8;
-                uint32_t b = (cb * alpha + bg_b * inv) >> 8;
+                for (int32_t x = x1; x <= x2; x++) {
+                    if (ct >= 0.0f && ch >= 0.0f) {
+                        float t = ct / (ct + ch);
+                        uint32_t alpha = (uint32_t)(255.0f * t * t);
+                        uint32_t t256 = (uint32_t)(t * 256);
+                        uint32_t it256 = 256 - t256;
+                        uint32_t cr = (tail_r * it256 + head_r * t256) >> 8;
+                        uint32_t cg = (tail_g * it256 + head_g * t256) >> 8;
+                        uint32_t cb = (tail_b * it256 + head_b * t256) >> 8;
+                        uint32_t inv = 255 - alpha;
+                        uint32_t r = (cr * alpha + bg_r * inv) >> 8;
+                        uint32_t g = (cg * alpha + bg_g * inv) >> 8;
+                        uint32_t b = (cb * alpha + bg_b * inv) >> 8;
+                        row_ptr[x] = (uint16_t)((r << 11) | (g << 5) | b);
 
-                comet_buf[y * COMET_SIZE + x] = (r << 11) | (g << 5) | b;
+                        if (x < row_x_min) row_x_min = x;
+                        if (x > row_x_max) row_x_max = x;
+                    }
+                    ct -= sin_tail;
+                    ch += sin_head;
+                }
+            }
 
-                /* Track dirty rect */
-                if (x < comet_dirty.x1) comet_dirty.x1 = x;
-                if (x > comet_dirty.x2) comet_dirty.x2 = x;
+            /* Track dirty rect at row granularity */
+            if (row_x_max >= row_x_min) {
+                if (row_x_min < comet_dirty.x1) comet_dirty.x1 = row_x_min;
+                if (row_x_max > comet_dirty.x2) comet_dirty.x2 = row_x_max;
                 if (y < comet_dirty.y1) comet_dirty.y1 = y;
                 if (y > comet_dirty.y2) comet_dirty.y2 = y;
             }
         }
     }
 
-    lv_obj_invalidate(comet_canvas);
+    /* Invalidate the union of old (cleared) + new (drawn) dirty rects */
+    int32_t ox = lv_obj_get_x(comet_canvas);
+    int32_t oy = lv_obj_get_y(comet_canvas);
+
+    /* Merge old and new dirty rects into one invalidation area */
+    lv_area_t merged;
+    merged.x1 = comet_dirty.x1;
+    merged.y1 = comet_dirty.y1;
+    merged.x2 = comet_dirty.x2;
+    merged.y2 = comet_dirty.y2;
+    if (old_dirty.x2 > old_dirty.x1) {
+        if (old_dirty.x1 < merged.x1) merged.x1 = old_dirty.x1;
+        if (old_dirty.y1 < merged.y1) merged.y1 = old_dirty.y1;
+        if (old_dirty.x2 > merged.x2) merged.x2 = old_dirty.x2;
+        if (old_dirty.y2 > merged.y2) merged.y2 = old_dirty.y2;
+    }
+
+    if (merged.x2 > merged.x1) {
+        overlay_scale(&merged);
+        lv_area_t screen_area;
+        screen_area.x1 = merged.x1 + ox;
+        screen_area.y1 = merged.y1 + oy;
+        screen_area.x2 = merged.x2 + ox;
+        screen_area.y2 = merged.y2 + oy;
+        lv_obj_invalidate_area(comet_canvas, &screen_area);
+    }
 }
+#endif /* !COMET_DISABLE */
 
 /* Pod colors */
 #define COL_POD_BG      lv_color_hex(0x1c1c1e)
@@ -457,6 +589,7 @@ void golden_screen_create(lv_obj_t* parent)
     lv_obj_set_style_pad_all(root, 0, 0);
     lv_obj_set_scrollbar_mode(root, LV_SCROLLBAR_MODE_OFF);
 
+#ifndef COMET_DISABLE
     /* ════════════════════════════════════════════
      *  COMET CANVAS — z-index 0, RGB565, comet tail in outer ring
      * ════════════════════════════════════════════ */
@@ -483,6 +616,7 @@ void golden_screen_create(lv_obj_t* parent)
         comet_dirty.x2 = 0; comet_dirty.y2 = 0;
         comet_last_rpm = -1;
     }
+#endif
 
     /* ════════════════════════════════════════════
      *  Chart — z-index 1, on top of comet canvas inner area
@@ -502,7 +636,8 @@ void golden_screen_create(lv_obj_t* parent)
         gs_map = map_renderer_create(chart_area, tile_path, 600);
         if (gs_map) {
             map_renderer_set_view(gs_map, 45.00, 14.61, 13);
-            map_renderer_set_vignette(gs_map, 0.65f, COL_BG);
+            /* Vignette disabled — pixel-by-pixel alpha blend is too expensive on ESP32 */
+            /* map_renderer_set_vignette(gs_map, 0.65f, COL_BG); */
             map_renderer_create_track_btn(gs_map, root, 220, 60);
             if (alt_tile_path) {
                 map_renderer_set_alt_tiles(gs_map, alt_tile_path, root, -220, 60);
@@ -563,6 +698,52 @@ void golden_screen_create(lv_obj_t* parent)
     lv_scale_set_post_draw(rpm_scale, true);
     lv_obj_remove_flag(rpm_scale, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(rpm_scale, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Snapshot the scale to ARGB8888.  The comet path merges scale pixels
+     * directly into the comet canvas (no separate LVGL image layer).
+     * The needle path keeps a separate lv_image widget. */
+    lv_obj_update_layout(rpm_scale);
+    lv_draw_buf_t* scale_snap = lv_snapshot_take(rpm_scale, LV_COLOR_FORMAT_ARGB8888);
+    if (scale_snap) {
+        lv_obj_delete(rpm_scale);
+        rpm_scale = NULL;
+    }
+
+#ifdef COMET_DISABLE
+    /* Needle path: show scale as a separate static image */
+    if (scale_snap) {
+        lv_obj_t* scale_img = lv_image_create(root);
+        lv_image_set_src(scale_img, scale_snap);
+        lv_obj_set_size(scale_img, RPM_SCALE_SIZE, RPM_SCALE_SIZE);
+        lv_obj_center(scale_img);
+        lv_obj_remove_flag(scale_img, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(scale_img, LV_OBJ_FLAG_SCROLLABLE);
+    }
+#else
+    /* Comet path: scale will be overlaid into the canvas buffer directly */
+    scale_overlay = scale_snap;
+    /* Draw initial scale onto canvas so it's visible before first comet_redraw */
+    if (scale_overlay && comet_buf) {
+        lv_area_t full = { 0, 0, COMET_SIZE - 1, COMET_SIZE - 1 };
+        overlay_scale(&full);
+    }
+#endif
+
+#ifdef COMET_DISABLE
+    /* Standalone line needle in the ring band (radius 310→378) */
+    needle_line = lv_line_create(root);
+    lv_obj_set_style_line_color(needle_line, lv_color_white(), 0);
+    lv_obj_set_style_line_width(needle_line, 4, 0);
+    lv_obj_set_style_line_rounded(needle_line, true, 0);
+    lv_obj_remove_flag(needle_line, LV_OBJ_FLAG_CLICKABLE);
+    /* Initial position at 0 RPM (135°) */
+    float init_rad = 135.0f * (float)M_PI / 180.0f;
+    needle_pts[0].x = DISP_SIZE / 2 + (int32_t)(COMET_RADIUS_INNER * cosf(init_rad));
+    needle_pts[0].y = DISP_SIZE / 2 + (int32_t)(COMET_RADIUS_INNER * sinf(init_rad));
+    needle_pts[1].x = DISP_SIZE / 2 + (int32_t)(COMET_RADIUS_OUTER * cosf(init_rad));
+    needle_pts[1].y = DISP_SIZE / 2 + (int32_t)(COMET_RADIUS_OUTER * sinf(init_rad));
+    lv_line_set_points(needle_line, needle_pts, 2);
+#endif
 
     /* ════════════════════════════════════════════
      *  SOG — with dark backdrop for readability over chart
@@ -683,111 +864,163 @@ void golden_screen_update(const gauge_data_t* d)
 {
     char buf[32];
 
-    /* Comet tail RPM gauge — dirty-check redraw (every frame) */
+#ifdef COMET_DISABLE
+    /* Ring-band needle — throttled, relative coords for tight invalidation */
+    {
+        static uint32_t needle_frame = 0;
+        static int32_t needle_last_rpm = -1;
+        int32_t rpm_int = (int32_t)d->rpm;
+        if (rpm_int != needle_last_rpm && ++needle_frame >= 3) {
+            needle_frame = 0;
+            needle_last_rpm = rpm_int;
+
+            float angle_deg = 135.0f + (d->rpm / (float)RPM_MAX) * 270.0f;
+            float angle_rad = angle_deg * (float)M_PI / 180.0f;
+            float cs = cosf(angle_rad), sn = sinf(angle_rad);
+            int32_t cx = DISP_SIZE / 2, cy = DISP_SIZE / 2;
+            int32_t x1 = cx + (int32_t)(COMET_RADIUS_INNER * cs);
+            int32_t y1 = cy + (int32_t)(COMET_RADIUS_INNER * sn);
+            int32_t x2 = cx + (int32_t)(COMET_RADIUS_OUTER * cs);
+            int32_t y2 = cy + (int32_t)(COMET_RADIUS_OUTER * sn);
+
+            /* Position line at bounding box origin, use relative points
+             * so lv_line auto-size is only ~68×68 — not 400×400 */
+            int32_t min_x = x1 < x2 ? x1 : x2;
+            int32_t min_y = y1 < y2 ? y1 : y2;
+            lv_obj_set_pos(needle_line, min_x, min_y);
+            needle_pts[0].x = x1 - min_x;
+            needle_pts[0].y = y1 - min_y;
+            needle_pts[1].x = x2 - min_x;
+            needle_pts[1].y = y2 - min_y;
+            lv_line_set_points(needle_line, needle_pts, 2);
+
+            if (d->rpm >= RPM_REDLINE)
+                lv_obj_set_style_line_color(needle_line, COL_RED, 0);
+            else if (d->rpm >= RPM_YELLOW)
+                lv_obj_set_style_line_color(needle_line, COL_YELLOW, 0);
+            else
+                lv_obj_set_style_line_color(needle_line, lv_color_white(), 0);
+        }
+    }
+#else
+    /* Comet tail RPM gauge — throttled to reduce canvas redraw load */
+    static uint32_t comet_frame = 0;
     int32_t rpm_int = (int32_t)d->rpm;
-    if (rpm_int != comet_last_rpm && comet_buf) {
+    if (rpm_int != comet_last_rpm && comet_buf && ++comet_frame >= 3) {
+        comet_frame = 0;
         comet_redraw(d->rpm);
         comet_last_rpm = rpm_int;
     }
+#endif
 
-    /* Update map position — throttled to ~2Hz (has its own counter) */
+    /* Update map position — throttled to ~0.5Hz to reduce SD read + canvas redraw load */
     static uint32_t map_frame = 0;
-    if (++map_frame >= 10) {
+    if (++map_frame >= 40) {
         map_frame = 0;
         if (gs_map && d->latitude != 0.0 && d->longitude != 0.0) {
             map_renderer_set_position(gs_map, d->latitude, d->longitude, d->cog_degrees);
         }
     }
 
-    /* Throttle slow-changing values (SOG, pods, readouts) to ~2Hz */
-    static uint32_t slow_frame = 0;
-    if (++slow_frame < 10) return;
-    slow_frame = 0;
+    /* Stagger slow-changing value updates across frames to avoid invalidation spikes.
+     * Each slot runs at ~4 Hz (every 5th call at 20 Hz input rate). */
+    static uint32_t slow_slot = 0;
+    slow_slot++;
+    uint32_t phase = slow_slot % 5;
 
-    /* SOG */
-    snprintf(buf, sizeof(buf), "%.1f", d->sog_knots);
-    lv_label_set_text(sog_label, buf);
-    lv_obj_align_to(sog_unit_label, sog_label, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -4);
+    if (phase == 0) {
+        /* Nav values + 2 pods */
+        snprintf(buf, sizeof(buf), "%.1f", d->sog_knots);
+        lv_label_set_text(sog_label, buf);
+        lv_obj_align_to(sog_unit_label, sog_label, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -4);
+        snprintf(buf, sizeof(buf), "%.1f m", d->depth_m);
+        lv_label_set_text(depth_label, buf);
+        lv_obj_align_to(depth_label, nav_sep, LV_ALIGN_OUT_LEFT_MID, -15, 0);
+        snprintf(buf, sizeof(buf), "%.0f °C", d->water_temp_c);
+        lv_label_set_text(watertemp_label, buf);
+    } else if (phase == 1) {
+        /* Oil temp + oil pressure pods */
+        lv_bar_set_value(pod_oilt.bar, (int32_t)d->oil_temp_c, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "%.0f", d->oil_temp_c);
+        pod_update_val(&pod_oilt, buf);
+        if (d->oil_temp_c > 125)      pod_set_alert(&pod_oilt, COL_RED);
+        else if (d->oil_temp_c > 110)  pod_set_alert(&pod_oilt, COL_YELLOW);
+        else                           pod_set_normal(&pod_oilt);
 
-    /* Depth — right-aligned to separator */
-    snprintf(buf, sizeof(buf), "%.1f m", d->depth_m);
-    lv_label_set_text(depth_label, buf);
-    lv_obj_align_to(depth_label, nav_sep, LV_ALIGN_OUT_LEFT_MID, -15, 0);
+        lv_bar_set_value(pod_oilp.bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "%.1f", d->oil_pressure_kpa / 100.0f);
+        pod_update_val(&pod_oilp, buf);
+        if (d->oil_pressure_kpa < 150)       pod_set_alert(&pod_oilp, COL_RED);
+        else if (d->oil_pressure_kpa < 250)  pod_set_alert(&pod_oilp, COL_YELLOW);
+        else                                 pod_set_normal(&pod_oilp);
+    } else if (phase == 2) {
+        /* Coolant temp + lambda pods */
+        lv_bar_set_value(pod_clt.bar, (int32_t)d->coolant_temp_c, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "%.0f", d->coolant_temp_c);
+        pod_update_val(&pod_clt, buf);
+        if (d->coolant_temp_c > 77)       pod_set_alert(&pod_clt, COL_RED);
+        else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
+        else                              pod_set_normal(&pod_clt);
 
-    /* Water temp — left-aligned to separator */
-    snprintf(buf, sizeof(buf), "%.0f °C", d->water_temp_c);
-    lv_label_set_text(watertemp_label, buf);
+        float worst_lambda = d->lambda1 > d->lambda2 ? d->lambda1 : d->lambda2;
+        lv_bar_set_value(pod_lam.bar, (int32_t)(worst_lambda * 100), LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "%.2f", worst_lambda);
+        pod_update_val(&pod_lam, buf);
+        if (worst_lambda < 0.85f || worst_lambda > 1.15f)       pod_set_alert(&pod_lam, COL_RED);
+        else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
+        else                                                    pod_set_normal(&pod_lam);
+    } else if (phase == 3) {
+        /* Coolant pressure + battery pods */
+        lv_bar_set_value(pod_cltp.bar, (int32_t)d->coolant_pressure_kpa, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "%.0f", d->coolant_pressure_kpa);
+        pod_update_val(&pod_cltp, buf);
+        if (d->coolant_pressure_kpa < 15)       pod_set_alert(&pod_cltp, COL_RED);
+        else if (d->coolant_pressure_kpa < 25)  pod_set_alert(&pod_cltp, COL_YELLOW);
+        else                                    pod_set_normal(&pod_cltp);
 
-    /* ── Pod updates with alert system ── */
+        lv_bar_set_value(pod_batt.bar, (int32_t)(d->battery_voltage * 10), LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "%.1f", d->battery_voltage);
+        pod_update_val(&pod_batt, buf);
+        if (d->battery_voltage < 12.0f)       pod_set_alert(&pod_batt, COL_RED);
+        else if (d->battery_voltage < 12.8f)  pod_set_alert(&pod_batt, COL_YELLOW);
+        else                                  pod_set_normal(&pod_batt);
+    } else {
+        /* Bottom readouts */
+        snprintf(buf, sizeof(buf), "L1 %.2f", d->lambda1);
+        lv_label_set_text(lbl_lambda1, buf);
+        snprintf(buf, sizeof(buf), "L2 %.2f", d->lambda2);
+        lv_label_set_text(lbl_lambda2, buf);
+        snprintf(buf, sizeof(buf), "IAT %.0f°C", d->iat_c);
+        lv_label_set_text(lbl_iat, buf);
+        snprintf(buf, sizeof(buf), "MAP %.0f kPa", d->map_kpa);
+        lv_label_set_text(lbl_map, buf);
+        snprintf(buf, sizeof(buf), "FP %.0f kPa", d->fuel_pressure_kpa);
+        lv_label_set_text(lbl_fp, buf);
+        snprintf(buf, sizeof(buf), "FC %.1f l/h", d->fuel_rate_lph);
+        lv_label_set_text(lbl_fuel, buf);
+    }
 
-    /* Oil temp pod */
-    lv_bar_set_value(pod_oilt.bar, (int32_t)d->oil_temp_c, LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.0f", d->oil_temp_c);
-    pod_update_val(&pod_oilt, buf);
-    if (d->oil_temp_c > 125)      pod_set_alert(&pod_oilt, COL_RED);
-    else if (d->oil_temp_c > 110)  pod_set_alert(&pod_oilt, COL_YELLOW);
-    else                           pod_set_normal(&pod_oilt);
+}
 
-    /* Oil pressure pod */
-    lv_bar_set_value(pod_oilp.bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.1f", d->oil_pressure_kpa / 100.0f);
-    pod_update_val(&pod_oilp, buf);
-    if (d->oil_pressure_kpa < 150)       pod_set_alert(&pod_oilp, COL_RED);
-    else if (d->oil_pressure_kpa < 250)  pod_set_alert(&pod_oilp, COL_YELLOW);
-    else                                 pod_set_normal(&pod_oilp);
+/* Debug: frame tick counter visible on screen to distinguish data stall from render lag */
+static lv_obj_t* dbg_tick_label = NULL;
 
-    /* Coolant temp pod */
-    lv_bar_set_value(pod_clt.bar, (int32_t)d->coolant_temp_c, LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.0f", d->coolant_temp_c);
-    pod_update_val(&pod_clt, buf);
-    if (d->coolant_temp_c > 77)       pod_set_alert(&pod_clt, COL_RED);
-    else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
-    else                              pod_set_normal(&pod_clt);
+void golden_screen_show_tick_counter(lv_obj_t* parent)
+{
+    dbg_tick_label = lv_label_create(parent);
+    lv_obj_set_style_text_color(dbg_tick_label, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_text_font(dbg_tick_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(dbg_tick_label, LV_ALIGN_TOP_MID, 0, 2);
+    lv_label_set_text(dbg_tick_label, "0");
+}
 
-    /* Lambda pod — worst (leanest) of both banks */
-    float worst_lambda = d->lambda1 > d->lambda2 ? d->lambda1 : d->lambda2;
-    lv_bar_set_value(pod_lam.bar, (int32_t)(worst_lambda * 100), LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.2f", worst_lambda);
-    pod_update_val(&pod_lam, buf);
-    if (worst_lambda < 0.85f || worst_lambda > 1.15f)       pod_set_alert(&pod_lam, COL_RED);
-    else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
-    else                                                    pod_set_normal(&pod_lam);
-
-    /* Coolant pressure pod */
-    lv_bar_set_value(pod_cltp.bar, (int32_t)d->coolant_pressure_kpa, LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.0f", d->coolant_pressure_kpa);
-    pod_update_val(&pod_cltp, buf);
-    if (d->coolant_pressure_kpa < 15)       pod_set_alert(&pod_cltp, COL_RED);
-    else if (d->coolant_pressure_kpa < 25)  pod_set_alert(&pod_cltp, COL_YELLOW);
-    else                                    pod_set_normal(&pod_cltp);
-
-    /* Battery voltage pod */
-    lv_bar_set_value(pod_batt.bar, (int32_t)(d->battery_voltage * 10), LV_ANIM_ON);
-    snprintf(buf, sizeof(buf), "%.1f", d->battery_voltage);
-    pod_update_val(&pod_batt, buf);
-    if (d->battery_voltage < 12.0f)       pod_set_alert(&pod_batt, COL_RED);
-    else if (d->battery_voltage < 12.8f)  pod_set_alert(&pod_batt, COL_YELLOW);
-    else                                  pod_set_normal(&pod_batt);
-
-    /* Bottom digital readouts — "KEY value unit" format */
-    snprintf(buf, sizeof(buf), "L1 %.2f", d->lambda1);
-    lv_label_set_text(lbl_lambda1, buf);
-
-    snprintf(buf, sizeof(buf), "L2 %.2f", d->lambda2);
-    lv_label_set_text(lbl_lambda2, buf);
-
-    snprintf(buf, sizeof(buf), "IAT %.0f°C", d->iat_c);
-    lv_label_set_text(lbl_iat, buf);
-
-    snprintf(buf, sizeof(buf), "MAP %.0f kPa", d->map_kpa);
-    lv_label_set_text(lbl_map, buf);
-
-    snprintf(buf, sizeof(buf), "FP %.0f kPa", d->fuel_pressure_kpa);
-    lv_label_set_text(lbl_fp, buf);
-
-    snprintf(buf, sizeof(buf), "FC %.1f l/h", d->fuel_rate_lph);
-    lv_label_set_text(lbl_fuel, buf);
-
+void golden_screen_update_tick(void)
+{
+    if (!dbg_tick_label) return;
+    static uint32_t tick = 0;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)(++tick));
+    lv_label_set_text(dbg_tick_label, buf);
 }
 
 map_renderer_t* golden_screen_get_map(void) { return gs_map; }

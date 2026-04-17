@@ -21,6 +21,8 @@
 
 /* Simulated gauge data — sweeps through values over time */
 static gauge_data_t sim_data;
+static bool sim_low_oil = false;
+static bool sim_overtemp = false;
 static uint32_t sim_tick = 0;
 
 static void sim_data_init(void)
@@ -45,7 +47,8 @@ static void sim_data_init(void)
     sim_data.depth_m = 8.5f;
     sim_data.water_temp_c = 18;
     sim_data.baro_pressure_kpa = 101.3f;
-    sim_data.can_active = true;
+    sim_data.engine_can_active = true;
+    sim_data.nav_can_active = true;
 }
 
 static void sim_data_update(void)
@@ -61,11 +64,13 @@ static void sim_data_update(void)
     /* MAP follows RPM loosely */
     sim_data.map_kpa = 30 + (sim_data.rpm / 6000.0f) * 80.0f + 5 * sinf(t * 2.0f);
 
-    /* Oil pressure follows RPM */
-    sim_data.oil_pressure_kpa = 150 + (sim_data.rpm / 6000.0f) * 350.0f;
+    /* Oil pressure follows RPM (unless overridden by test key) */
+    if (!sim_low_oil)
+        sim_data.oil_pressure_kpa = 150 + (sim_data.rpm / 6000.0f) * 350.0f;
 
-    /* Temperatures drift slowly */
-    sim_data.oil_temp_c = 85 + 15 * sinf(t * 0.3f);
+    /* Temperatures drift slowly (unless overridden by test key) */
+    if (!sim_overtemp)
+        sim_data.oil_temp_c = 85 + 15 * sinf(t * 0.3f);
     sim_data.coolant_temp_c = 70 + 8 * sinf(t * 0.25f);
     sim_data.water_temp_c = 16 + 4 * sinf(t * 0.1f);
 
@@ -99,6 +104,8 @@ static bool key_plus_was_down = false;
 static bool key_minus_was_down = false;
 static bool key_left_was_down = false;
 static bool key_right_was_down = false;
+static bool key_w_was_down = false;
+static bool key_e_was_down = false;
 
 static void sim_timer_cb(lv_timer_t* timer)
 {
@@ -126,6 +133,20 @@ static void sim_timer_cb(lv_timer_t* timer)
 
     if (left_down && !key_left_was_down)   screen_manager_prev();
     if (right_down && !key_right_was_down) screen_manager_next();
+
+    /* W = toggle simulated low oil pressure, E = toggle overtemperature */
+    bool w_down = (GetAsyncKeyState('W') & 0x8000) != 0;
+    bool e_down = (GetAsyncKeyState('E') & 0x8000) != 0;
+    if (w_down && !key_w_was_down) {
+        sim_low_oil = !sim_low_oil;
+        sim_data.oil_pressure_kpa = sim_low_oil ? 100.0f : 350.0f;
+    }
+    if (e_down && !key_e_was_down) {
+        sim_overtemp = !sim_overtemp;
+        sim_data.oil_temp_c = sim_overtemp ? 130.0f : 85.0f;
+    }
+    key_w_was_down = w_down;
+    key_e_was_down = e_down;
 
     key_left_was_down = left_down;
     key_right_was_down = right_down;

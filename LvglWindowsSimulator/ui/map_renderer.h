@@ -9,6 +9,7 @@ extern "C" {
 
 /* Opaque handle for a map renderer instance */
 typedef struct map_renderer map_renderer_t;
+typedef struct tile_cache tile_cache_t;
 
 /**
  * Create a new map renderer instance.
@@ -66,6 +67,17 @@ void map_renderer_create_track_btn(map_renderer_t* mr, lv_obj_t* btn_parent,
  */
 void map_renderer_set_alt_tiles(map_renderer_t* mr, const char* alt_tile_base,
     lv_obj_t* btn_parent, int32_t x_ofs, int32_t y_ofs);
+
+/**
+ * Attach a shared tile cache.  Enables async tile loading and LRU caching.
+ * Call after create, before the first render.
+ */
+void map_renderer_set_cache(map_renderer_t* mr, tile_cache_t* cache);
+
+/**
+ * Force a re-render (e.g. after background tile loads complete).
+ */
+void map_renderer_render(map_renderer_t* mr);
 
 /**
  * Get current view state.
