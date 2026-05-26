@@ -214,6 +214,7 @@ int main()
     screen_manager_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
     screen_manager_set_alt_tile_path("C:/Data/marine-gauge/tools/MAP_DARK");
     screen_manager_create();
+    screen_manager_set_demo(true);   /* simulator always runs on simulated data */
     screen_manager_update(&sim_data);
 
     /* Timer to update simulated data at ~50Hz */

@@ -21,6 +21,11 @@ void screen_manager_set_alt_tile_path(const char* path);
 void screen_manager_create(void);
 
 /**
+ * Show or hide the "DEMO" badge that marks simulated (non-live) data.
+ */
+void screen_manager_set_demo(bool demo);
+
+/**
  * Update all screens with current gauge data.
  */
 void screen_manager_update(const gauge_data_t* data);

@@ -16,6 +16,7 @@
 static const char* tile_path = NULL;
 static const char* alt_tile_path = NULL;
 static lv_obj_t* tileview;
+static lv_obj_t* demo_badge = NULL;   /* "DEMO" badge, shown when on simulated data */
 static int32_t current_screen = 0;
 static bool swiping = false;       /* true during tileview scroll animation */
 #define NUM_SCREENS 3
@@ -244,6 +245,19 @@ void screen_manager_create(void)
     /* Debug tick counter — on top of everything */
     golden_screen_show_tick_counter(circle);
 
+    /* DEMO badge — sibling on top, hidden until screen_manager_set_demo(true) */
+    demo_badge = lv_label_create(circle);
+    lv_label_set_text(demo_badge, "DEMO");
+    lv_obj_set_style_text_color(demo_badge, lv_color_hex(0xffb300), 0);
+    lv_obj_set_style_text_font(demo_badge, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_bg_color(demo_badge, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(demo_badge, LV_OPA_50, 0);
+    lv_obj_set_style_pad_hor(demo_badge, 8, 0);
+    lv_obj_set_style_pad_ver(demo_badge, 2, 0);
+    lv_obj_set_style_radius(demo_badge, 8, 0);
+    lv_obj_align(demo_badge, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_add_flag(demo_badge, LV_OBJ_FLAG_HIDDEN);
+
     /* Create shared tile cache and attach to map renderers */
     if (tile_path) {
         g_tile_cache = tile_cache_create(64);  /* 64 tiles × 128 KB = 8 MB */
@@ -255,6 +269,13 @@ void screen_manager_create(void)
             lv_timer_create(tile_ready_timer_cb, 500, NULL);  /* 2 Hz poll */
         }
     }
+}
+
+void screen_manager_set_demo(bool demo)
+{
+    if (!demo_badge) return;
+    if (demo) lv_obj_remove_flag(demo_badge, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(demo_badge, LV_OBJ_FLAG_HIDDEN);
 }
 
 void screen_manager_update(const gauge_data_t* d)
