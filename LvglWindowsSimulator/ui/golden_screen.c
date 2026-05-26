@@ -10,7 +10,7 @@
 
 /* Define COMET_DISABLE to replace the expensive canvas comet with a
  * lightweight LVGL arc needle — useful for performance profiling. */
-/* #define COMET_DISABLE */  /* uncomment to use ring-band needle instead of comet canvas */
+#define COMET_DISABLE  /* ring-band needle — better FPS than comet canvas */
 
 /* ── Layout constants ── */
 #define DISP_SIZE       800

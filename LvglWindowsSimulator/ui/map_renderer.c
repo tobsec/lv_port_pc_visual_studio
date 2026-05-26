@@ -9,6 +9,11 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* Map panning uses a custom drag handler (lv_obj_set_pos on the tile widgets).
+ * LVGL native scroll was tried but abandoned: lv_obj_create for tiles inside a
+ * scrollable container crashes via LVGL layer allocation on both Windows and
+ * ESP32. See docs/experiments/ for the parked native-scroll patch. */
+
 #define TILE_PX      256
 #define TILE_BYTES   (TILE_PX * TILE_PX * 2)  /* RGB565 */
 #define ZOOM_MIN     10
@@ -164,24 +169,16 @@ static void center_scroll_on_view(map_renderer_t* mr)
     apply_pan_offset(mr);
 }
 
-static void update_center_from_scroll(map_renderer_t* mr)
-{
-    /* center_tx/ty are already maintained by the drag handler */
-    (void)mr;
-}
-
 /* ── Grid boundary detection and shifting ── */
 
 static void check_grid_boundary(map_renderer_t* mr)
 {
     if (!mr->map_container) return;
 
-    /* Check if center has moved too close to grid edge */
     double offset_x = mr->center_tx - mr->grid_origin_tx;
     double offset_y = mr->center_ty - mr->grid_origin_ty;
     bool need_reload = false;
 
-    /* Re-center grid when within 1 tile of any edge */
     if (offset_x < 1.5 || offset_x > GRID_COLS - 1.5 ||
         offset_y < 1.5 || offset_y > GRID_ROWS - 1.5) {
         mr->grid_origin_tx = (int32_t)floor(mr->center_tx) - GRID_COLS / 2;
@@ -286,7 +283,6 @@ static void show_track_btn(map_renderer_t* mr, bool show)
 /* Pan offset: how many pixels the grid is shifted from its origin */
 static void apply_pan_offset(map_renderer_t* mr)
 {
-    /* Reposition all tile widgets based on grid_origin + pan offset */
     int32_t base_x = -(int32_t)((mr->center_tx - mr->grid_origin_tx) * TILE_PX) + mr->vp_size / 2;
     int32_t base_y = -(int32_t)((mr->center_ty - mr->grid_origin_ty) * TILE_PX) + mr->vp_size / 2;
 
@@ -294,7 +290,20 @@ static void apply_pan_offset(map_renderer_t* mr)
         if (!mr->tile_widgets[i]) continue;
         int32_t col = i % GRID_COLS;
         int32_t row = i / GRID_COLS;
-        lv_obj_set_pos(mr->tile_widgets[i], base_x + col * TILE_PX, base_y + row * TILE_PX);
+        int32_t px = base_x + col * TILE_PX;
+        int32_t py = base_y + row * TILE_PX;
+
+        /* Skip repositioning tiles that are fully off-screen */
+        bool visible = (px + TILE_PX > 0 && px < mr->vp_size &&
+                        py + TILE_PX > 0 && py < mr->vp_size);
+
+        if (visible) {
+            lv_obj_set_pos(mr->tile_widgets[i], px, py);
+            lv_obj_remove_flag(mr->tile_widgets[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            /* Hide off-screen tiles so LVGL skips them entirely during render */
+            lv_obj_add_flag(mr->tile_widgets[i], LV_OBJ_FLAG_HIDDEN);
+        }
     }
     if (mr->marker_img) update_marker_position(mr);
 }
@@ -372,19 +381,18 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
     mr->map_container = lv_obj_create(parent);
     lv_obj_set_size(mr->map_container, viewport_size, viewport_size);
     lv_obj_center(mr->map_container);
-    lv_obj_set_style_bg_opa(mr->map_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_color(mr->map_container, lv_color_black(), 0);
     lv_obj_set_style_border_width(mr->map_container, 0, 0);
+    lv_obj_set_style_radius(mr->map_container, 0, 0);  /* CRITICAL: radius=0 prevents layer alloc */
     lv_obj_set_style_pad_all(mr->map_container, 0, 0);
     lv_obj_set_scrollbar_mode(mr->map_container, LV_SCROLLBAR_MODE_OFF);
-    /* Don't use LVGL native scroll — it locks to one axis.
-     * Instead use custom PRESSING handler for free diagonal pan. */
+    /* Custom drag handler drives panning (see drag_cb) */
     lv_obj_add_flag(mr->map_container, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(mr->map_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(mr->map_container, LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_remove_flag(mr->map_container, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
-    /* ── Tile images directly inside map_container (no intermediate group) ── */
-    mr->map_group = mr->map_container;  /* alias — tiles are direct children */
+    mr->map_group = mr->map_container;
 
     mr->marker_img = NULL;
     mr->marker_buf = NULL;
@@ -406,14 +414,14 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
 
         int32_t col = i % GRID_COLS;
         int32_t row = i / GRID_COLS;
-        mr->tile_widgets[i] = lv_image_create(mr->map_container);
+        mr->tile_widgets[i] = lv_image_create(mr->map_group);
         lv_obj_set_pos(mr->tile_widgets[i], col * TILE_PX, row * TILE_PX);
         lv_image_set_src(mr->tile_widgets[i], &mr->tile_dbufs[i]);
         lv_obj_remove_flag(mr->tile_widgets[i], LV_OBJ_FLAG_CLICKABLE);
         lv_obj_remove_flag(mr->tile_widgets[i], LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    /* ── Touch handling for drag ── */
+    /* Touch handling for the custom drag pan */
     #define PAN_EDGE_PX 100
     lv_obj_t* touch_target;
     if (viewport_size >= 800) {
@@ -484,7 +492,6 @@ void map_renderer_pan(map_renderer_t* mr, int32_t dx, int32_t dy)
 void map_renderer_zoom_in(map_renderer_t* mr)
 {
     if (mr->current_zoom < ZOOM_MAX) {
-        update_center_from_scroll(mr);
         mr->current_zoom++;
         update_tile_coords(mr);
         mr->grid_origin_tx = (int32_t)floor(mr->center_tx) - GRID_COLS / 2;
@@ -499,7 +506,6 @@ void map_renderer_zoom_in(map_renderer_t* mr)
 void map_renderer_zoom_out(map_renderer_t* mr)
 {
     if (mr->current_zoom > ZOOM_MIN) {
-        update_center_from_scroll(mr);
         mr->current_zoom--;
         update_tile_coords(mr);
         mr->grid_origin_tx = (int32_t)floor(mr->center_tx) - GRID_COLS / 2;
