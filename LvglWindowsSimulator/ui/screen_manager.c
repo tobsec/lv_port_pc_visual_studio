@@ -4,6 +4,10 @@
 #include "tile_cache.h"
 #include "warning_overlay.h"
 #include <stdio.h>
+#include <string.h>
+
+/* Debug-only on-screen frame counter (forces a redraw every frame). */
+#define SCREEN_DEBUG_TICK 0
 
 #define DISP_SIZE 800
 
@@ -428,8 +432,9 @@ void screen_manager_create(void)
     warning_overlay_init(circle);
     warning_overlay_set_thresholds(&s_thr_vals);   /* apply persisted thresholds */
 
-    /* Debug tick counter — on top of everything */
+#if SCREEN_DEBUG_TICK
     golden_screen_show_tick_counter(circle);
+#endif
 
     /* DEMO badge — sibling on top, hidden until screen_manager_set_demo(true) */
     demo_badge = lv_label_create(circle);
@@ -495,14 +500,32 @@ void screen_manager_set_thresholds(const warn_thresholds_t* t)
 
 void screen_manager_update(const gauge_data_t* d)
 {
-    /* Debug tick counter — always increments to show data liveness */
-    golden_screen_update_tick();
+#if SCREEN_DEBUG_TICK
+    golden_screen_update_tick();   /* forces a redraw every frame — debug only */
+#endif
 
     /* Freeze all updates during swipe transition */
     if (swiping) return;
 
-    /* Warning overlay — always active regardless of screen */
+    /* Warning overlay — always run: its debounce/timeouts are time-based. */
     warning_overlay_update(d);
+
+    /* Skip all value/widget updates when nothing relevant changed, so a static
+     * screen (e.g. no CAN data, all "---") does no rendering and idles the CPU.
+     * Ignore the churning last_update_ms timestamp; force a refresh when the
+     * active screen changes (a swipe lands on a new tile). */
+    static gauge_data_t prev;
+    static bool have_prev = false;
+    static int32_t last_render_screen = -1;
+    gauge_data_t cur = *d;
+    cur.last_update_ms = 0;
+    if (have_prev && current_screen == last_render_screen &&
+        memcmp(&cur, &prev, sizeof(cur)) == 0) {
+        return;
+    }
+    prev = cur;
+    have_prev = true;
+    last_render_screen = current_screen;
 
     /* Golden gauge (comet + map + pods) — only when visible */
     if (current_screen == SCREEN_GOLDEN)
