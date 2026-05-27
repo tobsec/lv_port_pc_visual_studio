@@ -893,21 +893,21 @@ void golden_screen_update(const gauge_data_t* d)
     char buf[32];
 
 #ifdef COMET_DISABLE
-    /* Ring-band needle — updates every UI tick on RPM change (relative coords
-     * keep invalidation tight). Data is fed by a Core-0 task, so it stays smooth. */
+    /* Ring-band needle (relative coords keep invalidation tight; data is fed by
+     * a Core-0 task so it stays smooth). Redraw only when the tip actually moves
+     * >= ~1px — at this radius ~3 RPM — so it's smooth without sub-pixel churn. */
     {
-        static int32_t needle_last_rpm = -1;
-        int32_t rpm_int = (int32_t)d->rpm;
+        static float needle_last_rpm = -1000.0f;
         /* Hide the needle entirely when the RPM PDU (127488) has timed out. */
         if (!d->valid.engine_rapid) {
             lv_obj_add_flag(needle_line, LV_OBJ_FLAG_HIDDEN);
-            needle_last_rpm = -1;
+            needle_last_rpm = -1000.0f;
         } else if (lv_obj_has_flag(needle_line, LV_OBJ_FLAG_HIDDEN)) {
             lv_obj_remove_flag(needle_line, LV_OBJ_FLAG_HIDDEN);
-            needle_last_rpm = -1;  /* force a redraw now that it is visible again */
+            needle_last_rpm = -1000.0f;  /* force a redraw now that it is visible again */
         }
-        if (d->valid.engine_rapid && rpm_int != needle_last_rpm) {
-            needle_last_rpm = rpm_int;
+        if (d->valid.engine_rapid && fabsf(d->rpm - needle_last_rpm) >= 3.0f) {
+            needle_last_rpm = d->rpm;
 
             float angle_deg = 135.0f + (d->rpm / (float)RPM_MAX) * 270.0f;
             float angle_rad = angle_deg * (float)M_PI / 180.0f;
