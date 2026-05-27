@@ -69,11 +69,13 @@ static void init_warnings(void)
 {
     memset(warnings, 0, sizeof(warnings));
 
-    /* Critical */
+    /* Engine CAN timeout is a normal condition when the ignition is off (ECU
+     * unpowered), so it's a warning, not a red critical. */
     warnings[WID_ENGINE_CAN_TIMEOUT] = (warning_state_t){
-        .severity = WARN_CRITICAL, .priority = 0, .title = "ENGINE CAN TIMEOUT",
+        .severity = WARN_WARNING, .priority = 0, .title = "ENGINE CAN TIMEOUT",
         .debounce_ms = 2000, .depends_on = DEP_NONE };
 
+    /* Critical */
     warnings[WID_EMERGENCY_STOP] = (warning_state_t){
         .severity = WARN_CRITICAL, .priority = 1, .title = "EMERGENCY STOP",
         .debounce_ms = 0, .depends_on = DEP_ENGINE_CAN };
@@ -263,7 +265,7 @@ static void show_warning(int32_t id)
             lv_obj_set_style_border_width(overlay_panel, 2, 0);
             lv_obj_set_style_bg_color(overlay_panel, COL_WARN_BLUE_BG, 0);
             lv_obj_set_style_text_color(overlay_icon, COL_WARN_BLUE, 0);
-            lv_obj_add_flag(overlay_ack_btn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(overlay_ack_btn, LV_OBJ_FLAG_HIDDEN);  /* info is dismissable */
             stop_pulse();
             break;
         default:
@@ -441,15 +443,8 @@ void warning_overlay_update(const gauge_data_t* d)
             hyst_below(d->depth_m, 2.0f, 2.5f, warnings[WID_DEPTH_LOW].active), now);
     }
 
-    /* ── Info auto-dismiss ── */
-    for (int i = 0; i < WID_COUNT; i++) {
-        if (warnings[i].severity == WARN_INFO && warnings[i].active &&
-            warnings[i].activate_time > 0 &&
-            now - warnings[i].activate_time > 5000) {
-            warnings[i].active = false;
-            warnings[i].activate_time = 0;
-        }
-    }
+    /* Info warnings are dismissed by ACK (like warnings), not on a timer —
+     * a timed auto-dismiss made persistent infos blink every few seconds. */
 
     /* ── Find highest priority warning to show ── */
     /* Critical: show while was_active && !acknowledged (persists after condition clears)
@@ -460,10 +455,8 @@ void warning_overlay_update(const gauge_data_t* d)
         bool should_show;
         if (warnings[i].severity == WARN_CRITICAL)
             should_show = warnings[i].was_active && !warnings[i].acknowledged;
-        else if (warnings[i].severity == WARN_WARNING)
+        else /* WARN_WARNING or WARN_INFO — both dismissable by ACK */
             should_show = warnings[i].active && !warnings[i].acknowledged;
-        else
-            should_show = warnings[i].active;
 
         if (!should_show) continue;
         if (best < 0 || warnings[i].priority < warnings[best].priority)
@@ -517,10 +510,8 @@ void warning_overlay_ack(void)
             bool should_show;
             if (warnings[i].severity == WARN_CRITICAL)
                 should_show = warnings[i].was_active && !warnings[i].acknowledged;
-            else if (warnings[i].severity == WARN_WARNING)
+            else /* WARN_WARNING or WARN_INFO */
                 should_show = warnings[i].active && !warnings[i].acknowledged;
-            else
-                should_show = warnings[i].active;
             if (!should_show) continue;
             if (next < 0 || warnings[i].priority < warnings[next].priority)
                 next = i;

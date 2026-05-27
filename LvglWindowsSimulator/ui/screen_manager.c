@@ -312,7 +312,7 @@ void screen_manager_update(const gauge_data_t* d)
         static uint32_t s2_label_frame = 0;
         if (++s2_label_frame >= 5) {
             s2_label_frame = 0;
-            set_val(s2_sog_label, d->valid.cogsog, "%.1f kn", d->sog_knots, "--- kn");
+            set_val(s2_sog_label, d->valid.cogsog, "%.1f kn", d->sog_knots, "-.- kn");
             set_val(s2_cog_label, d->valid.cogsog, "%.0f°", d->cog_degrees, "---°");
         }
     }
@@ -325,15 +325,15 @@ void screen_manager_update(const gauge_data_t* d)
 
         set_val(s3_rpm_label,    d->valid.engine_rapid, "%.0f RPM",  d->rpm, "--- RPM");
         set_val(s3_oilt_label,   d->valid.engine_dyn,   "%.0f°C",    d->oil_temp_c, "---°C");
-        set_val(s3_oilp_label,   d->valid.engine_dyn,   "%.1f bar",  d->oil_pressure_kpa / 100.0, "--- bar");
+        set_val(s3_oilp_label,   d->valid.engine_dyn,   "%.1f bar",  d->oil_pressure_kpa / 100.0, "-.- bar");
         set_val(s3_clt_label,    d->valid.engine_dyn,   "%.0f°C",    d->coolant_temp_c, "---°C");
         set_val(s3_iat_label,    d->valid.iat,          "%.0f°C",    d->iat_c, "---°C");
-        set_val(s3_lambda1_label, d->valid.lambda1,     "%.3f",      d->lambda1, "---");
-        set_val(s3_lambda2_label, d->valid.lambda2,     "%.3f",      d->lambda2, "---");
+        set_val(s3_lambda1_label, d->valid.lambda1,     "%.3f",      d->lambda1, "-.---");
+        set_val(s3_lambda2_label, d->valid.lambda2,     "%.3f",      d->lambda2, "-.---");
         set_val(s3_map_label,    d->valid.engine_rapid, "%.0f kPa",  d->map_kpa, "--- kPa");
         set_val(s3_fp_label,     d->valid.engine_dyn,   "%.0f kPa",  d->fuel_pressure_kpa, "--- kPa");
-        set_val(s3_batt_label,   d->valid.engine_dyn,   "%.1fV",     d->battery_voltage, "---V");
-        set_val(s3_fuel_label,   d->valid.engine_dyn,   "%.1f l/h",  d->fuel_rate_lph, "--- l/h");
+        set_val(s3_batt_label,   d->valid.engine_dyn,   "%.1fV",     d->battery_voltage, "-.-V");
+        set_val(s3_fuel_label,   d->valid.engine_dyn,   "%.1f l/h",  d->fuel_rate_lph, "-.- l/h");
         set_val(s3_cltp_label,   d->valid.engine_dyn,   "%.0f kPa",  d->coolant_pressure_kpa, "--- kPa");
         set_val(s3_hours_label,  d->valid.engine_dyn,   "%.0fh",     d->engine_hours_s / 3600.0, "---h");
         s3_skip:;

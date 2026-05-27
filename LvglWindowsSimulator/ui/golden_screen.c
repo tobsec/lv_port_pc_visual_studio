@@ -558,11 +558,11 @@ static void set_val(lv_obj_t* lbl, bool valid, const char* fmt, double v, const 
     else lv_label_set_text(lbl, dash);
 }
 
-/* Pod showing stale data: "---", cleared bar, normal styling. */
-static void pod_show_dash(gauge_pod_t* p)
+/* Pod showing stale data: dash placeholder, cleared bar, normal styling. */
+static void pod_show_dash(gauge_pod_t* p, const char* dash)
 {
     lv_bar_set_value(p->bar, 0, LV_ANIM_OFF);
-    pod_update_val(p, "---");
+    pod_update_val(p, dash);
     pod_set_normal(p);
 }
 
@@ -885,7 +885,15 @@ void golden_screen_update(const gauge_data_t* d)
         static uint32_t needle_frame = 0;
         static int32_t needle_last_rpm = -1;
         int32_t rpm_int = (int32_t)d->rpm;
-        if (rpm_int != needle_last_rpm && ++needle_frame >= 3) {
+        /* Hide the needle entirely when the RPM PDU (127488) has timed out. */
+        if (!d->valid.engine_rapid) {
+            lv_obj_add_flag(needle_line, LV_OBJ_FLAG_HIDDEN);
+            needle_last_rpm = -1;
+        } else if (lv_obj_has_flag(needle_line, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(needle_line, LV_OBJ_FLAG_HIDDEN);
+            needle_last_rpm = -1;  /* force a redraw now that it is visible again */
+        }
+        if (d->valid.engine_rapid && rpm_int != needle_last_rpm && ++needle_frame >= 3) {
             needle_frame = 0;
             needle_last_rpm = rpm_int;
 
@@ -945,9 +953,9 @@ void golden_screen_update(const gauge_data_t* d)
 
     if (phase == 0) {
         /* Nav values (each per its own PDU) */
-        set_val(sog_label, d->valid.cogsog, "%.1f", d->sog_knots, "---");
+        set_val(sog_label, d->valid.cogsog, "%.1f", d->sog_knots, "-.-");
         lv_obj_align_to(sog_unit_label, sog_label, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -4);
-        set_val(depth_label, d->valid.depth, "%.1f m", d->depth_m, "--- m");
+        set_val(depth_label, d->valid.depth, "%.1f m", d->depth_m, "-.- m");
         lv_obj_align_to(depth_label, nav_sep, LV_ALIGN_OUT_LEFT_MID, -15, 0);
         set_val(watertemp_label, d->valid.water_temp, "%.0f °C", d->water_temp_c, "--- °C");
     } else if (phase == 1) {
@@ -967,8 +975,8 @@ void golden_screen_update(const gauge_data_t* d)
             else if (d->oil_pressure_kpa < 250)  pod_set_alert(&pod_oilp, COL_YELLOW);
             else                                 pod_set_normal(&pod_oilp);
         } else {
-            pod_show_dash(&pod_oilt);
-            pod_show_dash(&pod_oilp);
+            pod_show_dash(&pod_oilt, "---");
+            pod_show_dash(&pod_oilp, "-.-");
         }
     } else if (phase == 2) {
         /* Coolant temp (127489) + lambda (raw CAN) pods */
@@ -980,7 +988,7 @@ void golden_screen_update(const gauge_data_t* d)
             else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
             else                              pod_set_normal(&pod_clt);
         } else {
-            pod_show_dash(&pod_clt);
+            pod_show_dash(&pod_clt, "---");
         }
 
         if (d->valid.lambda1 || d->valid.lambda2) {
@@ -992,7 +1000,7 @@ void golden_screen_update(const gauge_data_t* d)
             else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
             else                                                    pod_set_normal(&pod_lam);
         } else {
-            pod_show_dash(&pod_lam);
+            pod_show_dash(&pod_lam, "-.--");
         }
     } else if (phase == 3) {
         /* Coolant pressure + battery pods (PGN 127489) */
@@ -1011,17 +1019,17 @@ void golden_screen_update(const gauge_data_t* d)
             else if (d->battery_voltage < 12.8f)  pod_set_alert(&pod_batt, COL_YELLOW);
             else                                  pod_set_normal(&pod_batt);
         } else {
-            pod_show_dash(&pod_cltp);
-            pod_show_dash(&pod_batt);
+            pod_show_dash(&pod_cltp, "---");
+            pod_show_dash(&pod_batt, "-.-");
         }
     } else {
         /* Bottom readouts (each per its own PDU) */
-        set_val(lbl_lambda1, d->valid.lambda1, "L1 %.2f", d->lambda1, "L1 ---");
-        set_val(lbl_lambda2, d->valid.lambda2, "L2 %.2f", d->lambda2, "L2 ---");
-        set_val(lbl_iat, d->valid.iat, "IAT %.0f°C", d->iat_c, "IAT ---");
-        set_val(lbl_map, d->valid.engine_rapid, "MAP %.0f kPa", d->map_kpa, "MAP ---");
-        set_val(lbl_fp, d->valid.engine_dyn, "FP %.0f kPa", d->fuel_pressure_kpa, "FP ---");
-        set_val(lbl_fuel, d->valid.engine_dyn, "FC %.1f l/h", d->fuel_rate_lph, "FC ---");
+        set_val(lbl_lambda1, d->valid.lambda1, "L1 %.2f", d->lambda1, "L1 -.--");
+        set_val(lbl_lambda2, d->valid.lambda2, "L2 %.2f", d->lambda2, "L2 -.--");
+        set_val(lbl_iat, d->valid.iat, "IAT %.0f°C", d->iat_c, "IAT ---°C");
+        set_val(lbl_map, d->valid.engine_rapid, "MAP %.0f kPa", d->map_kpa, "MAP --- kPa");
+        set_val(lbl_fp, d->valid.engine_dyn, "FP %.0f kPa", d->fuel_pressure_kpa, "FP --- kPa");
+        set_val(lbl_fuel, d->valid.engine_dyn, "FC %.1f l/h", d->fuel_rate_lph, "FC -.- l/h");
     }
 
 }
