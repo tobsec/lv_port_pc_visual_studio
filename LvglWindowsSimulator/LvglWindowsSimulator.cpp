@@ -49,6 +49,11 @@ static void sim_data_init(void)
     sim_data.baro_pressure_kpa = 101.3f;
     sim_data.engine_can_active = true;
     sim_data.nav_can_active = true;
+    /* Mark every PDU valid so the simulator never shows "---". */
+    sim_data.valid.engine_rapid = sim_data.valid.engine_dyn = sim_data.valid.iat = true;
+    sim_data.valid.lambda1 = sim_data.valid.lambda2 = true;
+    sim_data.valid.position = sim_data.valid.cogsog = sim_data.valid.depth = true;
+    sim_data.valid.heading = sim_data.valid.water_temp = true;
 }
 
 static void sim_data_update(void)

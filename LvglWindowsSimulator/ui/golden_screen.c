@@ -551,6 +551,21 @@ static lv_obj_t* create_readout(lv_obj_t* parent, int32_t x, int32_t y, const ch
     return lbl;
 }
 
+/* Label = formatted value, or a "---" placeholder when the source PDU is stale. */
+static void set_val(lv_obj_t* lbl, bool valid, const char* fmt, double v, const char* dash)
+{
+    if (valid) { char b[32]; snprintf(b, sizeof(b), fmt, v); lv_label_set_text(lbl, b); }
+    else lv_label_set_text(lbl, dash);
+}
+
+/* Pod showing stale data: "---", cleared bar, normal styling. */
+static void pod_show_dash(gauge_pod_t* p)
+{
+    lv_bar_set_value(p->bar, 0, LV_ANIM_OFF);
+    pod_update_val(p, "---");
+    pod_set_normal(p);
+}
+
 void golden_screen_set_tile_path(const char* path)
 {
     tile_path = path;
@@ -929,75 +944,84 @@ void golden_screen_update(const gauge_data_t* d)
     uint32_t phase = slow_slot % 5;
 
     if (phase == 0) {
-        /* Nav values + 2 pods */
-        snprintf(buf, sizeof(buf), "%.1f", d->sog_knots);
-        lv_label_set_text(sog_label, buf);
+        /* Nav values (each per its own PDU) */
+        set_val(sog_label, d->valid.cogsog, "%.1f", d->sog_knots, "---");
         lv_obj_align_to(sog_unit_label, sog_label, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -4);
-        snprintf(buf, sizeof(buf), "%.1f m", d->depth_m);
-        lv_label_set_text(depth_label, buf);
+        set_val(depth_label, d->valid.depth, "%.1f m", d->depth_m, "--- m");
         lv_obj_align_to(depth_label, nav_sep, LV_ALIGN_OUT_LEFT_MID, -15, 0);
-        snprintf(buf, sizeof(buf), "%.0f °C", d->water_temp_c);
-        lv_label_set_text(watertemp_label, buf);
+        set_val(watertemp_label, d->valid.water_temp, "%.0f °C", d->water_temp_c, "--- °C");
     } else if (phase == 1) {
-        /* Oil temp + oil pressure pods */
-        lv_bar_set_value(pod_oilt.bar, (int32_t)d->oil_temp_c, LV_ANIM_OFF);
-        snprintf(buf, sizeof(buf), "%.0f", d->oil_temp_c);
-        pod_update_val(&pod_oilt, buf);
-        if (d->oil_temp_c > 125)      pod_set_alert(&pod_oilt, COL_RED);
-        else if (d->oil_temp_c > 110)  pod_set_alert(&pod_oilt, COL_YELLOW);
-        else                           pod_set_normal(&pod_oilt);
+        /* Oil temp + oil pressure pods (PGN 127489) */
+        if (d->valid.engine_dyn) {
+            lv_bar_set_value(pod_oilt.bar, (int32_t)d->oil_temp_c, LV_ANIM_OFF);
+            snprintf(buf, sizeof(buf), "%.0f", d->oil_temp_c);
+            pod_update_val(&pod_oilt, buf);
+            if (d->oil_temp_c > 125)      pod_set_alert(&pod_oilt, COL_RED);
+            else if (d->oil_temp_c > 110)  pod_set_alert(&pod_oilt, COL_YELLOW);
+            else                           pod_set_normal(&pod_oilt);
 
-        lv_bar_set_value(pod_oilp.bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_OFF);
-        snprintf(buf, sizeof(buf), "%.1f", d->oil_pressure_kpa / 100.0f);
-        pod_update_val(&pod_oilp, buf);
-        if (d->oil_pressure_kpa < 150)       pod_set_alert(&pod_oilp, COL_RED);
-        else if (d->oil_pressure_kpa < 250)  pod_set_alert(&pod_oilp, COL_YELLOW);
-        else                                 pod_set_normal(&pod_oilp);
+            lv_bar_set_value(pod_oilp.bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_OFF);
+            snprintf(buf, sizeof(buf), "%.1f", d->oil_pressure_kpa / 100.0f);
+            pod_update_val(&pod_oilp, buf);
+            if (d->oil_pressure_kpa < 150)       pod_set_alert(&pod_oilp, COL_RED);
+            else if (d->oil_pressure_kpa < 250)  pod_set_alert(&pod_oilp, COL_YELLOW);
+            else                                 pod_set_normal(&pod_oilp);
+        } else {
+            pod_show_dash(&pod_oilt);
+            pod_show_dash(&pod_oilp);
+        }
     } else if (phase == 2) {
-        /* Coolant temp + lambda pods */
-        lv_bar_set_value(pod_clt.bar, (int32_t)d->coolant_temp_c, LV_ANIM_OFF);
-        snprintf(buf, sizeof(buf), "%.0f", d->coolant_temp_c);
-        pod_update_val(&pod_clt, buf);
-        if (d->coolant_temp_c > 77)       pod_set_alert(&pod_clt, COL_RED);
-        else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
-        else                              pod_set_normal(&pod_clt);
+        /* Coolant temp (127489) + lambda (raw CAN) pods */
+        if (d->valid.engine_dyn) {
+            lv_bar_set_value(pod_clt.bar, (int32_t)d->coolant_temp_c, LV_ANIM_OFF);
+            snprintf(buf, sizeof(buf), "%.0f", d->coolant_temp_c);
+            pod_update_val(&pod_clt, buf);
+            if (d->coolant_temp_c > 77)       pod_set_alert(&pod_clt, COL_RED);
+            else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
+            else                              pod_set_normal(&pod_clt);
+        } else {
+            pod_show_dash(&pod_clt);
+        }
 
-        float worst_lambda = d->lambda1 > d->lambda2 ? d->lambda1 : d->lambda2;
-        lv_bar_set_value(pod_lam.bar, (int32_t)(worst_lambda * 100), LV_ANIM_OFF);
-        snprintf(buf, sizeof(buf), "%.2f", worst_lambda);
-        pod_update_val(&pod_lam, buf);
-        if (worst_lambda < 0.85f || worst_lambda > 1.15f)       pod_set_alert(&pod_lam, COL_RED);
-        else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
-        else                                                    pod_set_normal(&pod_lam);
+        if (d->valid.lambda1 || d->valid.lambda2) {
+            float worst_lambda = d->lambda1 > d->lambda2 ? d->lambda1 : d->lambda2;
+            lv_bar_set_value(pod_lam.bar, (int32_t)(worst_lambda * 100), LV_ANIM_OFF);
+            snprintf(buf, sizeof(buf), "%.2f", worst_lambda);
+            pod_update_val(&pod_lam, buf);
+            if (worst_lambda < 0.85f || worst_lambda > 1.15f)       pod_set_alert(&pod_lam, COL_RED);
+            else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
+            else                                                    pod_set_normal(&pod_lam);
+        } else {
+            pod_show_dash(&pod_lam);
+        }
     } else if (phase == 3) {
-        /* Coolant pressure + battery pods */
-        lv_bar_set_value(pod_cltp.bar, (int32_t)d->coolant_pressure_kpa, LV_ANIM_OFF);
-        snprintf(buf, sizeof(buf), "%.0f", d->coolant_pressure_kpa);
-        pod_update_val(&pod_cltp, buf);
-        if (d->coolant_pressure_kpa < 15)       pod_set_alert(&pod_cltp, COL_RED);
-        else if (d->coolant_pressure_kpa < 25)  pod_set_alert(&pod_cltp, COL_YELLOW);
-        else                                    pod_set_normal(&pod_cltp);
+        /* Coolant pressure + battery pods (PGN 127489) */
+        if (d->valid.engine_dyn) {
+            lv_bar_set_value(pod_cltp.bar, (int32_t)d->coolant_pressure_kpa, LV_ANIM_OFF);
+            snprintf(buf, sizeof(buf), "%.0f", d->coolant_pressure_kpa);
+            pod_update_val(&pod_cltp, buf);
+            if (d->coolant_pressure_kpa < 15)       pod_set_alert(&pod_cltp, COL_RED);
+            else if (d->coolant_pressure_kpa < 25)  pod_set_alert(&pod_cltp, COL_YELLOW);
+            else                                    pod_set_normal(&pod_cltp);
 
-        lv_bar_set_value(pod_batt.bar, (int32_t)(d->battery_voltage * 10), LV_ANIM_OFF);
-        snprintf(buf, sizeof(buf), "%.1f", d->battery_voltage);
-        pod_update_val(&pod_batt, buf);
-        if (d->battery_voltage < 12.0f)       pod_set_alert(&pod_batt, COL_RED);
-        else if (d->battery_voltage < 12.8f)  pod_set_alert(&pod_batt, COL_YELLOW);
-        else                                  pod_set_normal(&pod_batt);
+            lv_bar_set_value(pod_batt.bar, (int32_t)(d->battery_voltage * 10), LV_ANIM_OFF);
+            snprintf(buf, sizeof(buf), "%.1f", d->battery_voltage);
+            pod_update_val(&pod_batt, buf);
+            if (d->battery_voltage < 12.0f)       pod_set_alert(&pod_batt, COL_RED);
+            else if (d->battery_voltage < 12.8f)  pod_set_alert(&pod_batt, COL_YELLOW);
+            else                                  pod_set_normal(&pod_batt);
+        } else {
+            pod_show_dash(&pod_cltp);
+            pod_show_dash(&pod_batt);
+        }
     } else {
-        /* Bottom readouts */
-        snprintf(buf, sizeof(buf), "L1 %.2f", d->lambda1);
-        lv_label_set_text(lbl_lambda1, buf);
-        snprintf(buf, sizeof(buf), "L2 %.2f", d->lambda2);
-        lv_label_set_text(lbl_lambda2, buf);
-        snprintf(buf, sizeof(buf), "IAT %.0f°C", d->iat_c);
-        lv_label_set_text(lbl_iat, buf);
-        snprintf(buf, sizeof(buf), "MAP %.0f kPa", d->map_kpa);
-        lv_label_set_text(lbl_map, buf);
-        snprintf(buf, sizeof(buf), "FP %.0f kPa", d->fuel_pressure_kpa);
-        lv_label_set_text(lbl_fp, buf);
-        snprintf(buf, sizeof(buf), "FC %.1f l/h", d->fuel_rate_lph);
-        lv_label_set_text(lbl_fuel, buf);
+        /* Bottom readouts (each per its own PDU) */
+        set_val(lbl_lambda1, d->valid.lambda1, "L1 %.2f", d->lambda1, "L1 ---");
+        set_val(lbl_lambda2, d->valid.lambda2, "L2 %.2f", d->lambda2, "L2 ---");
+        set_val(lbl_iat, d->valid.iat, "IAT %.0f°C", d->iat_c, "IAT ---");
+        set_val(lbl_map, d->valid.engine_rapid, "MAP %.0f kPa", d->map_kpa, "MAP ---");
+        set_val(lbl_fp, d->valid.engine_dyn, "FP %.0f kPa", d->fuel_pressure_kpa, "FP ---");
+        set_val(lbl_fuel, d->valid.engine_dyn, "FC %.1f l/h", d->fuel_rate_lph, "FC ---");
     }
 
 }

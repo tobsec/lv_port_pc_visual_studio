@@ -44,8 +44,23 @@ typedef struct {
 
     /* Metadata */
     uint32_t last_update_ms;
-    bool engine_can_active;  /* rusEFI ECU messages received within 2s */
-    bool nav_can_active;     /* Raymarine a78 messages received within 2s */
+    bool engine_can_active;  /* any rusEFI ECU PGN received within timeout */
+    bool nav_can_active;     /* any Raymarine a78 PGN received within timeout */
+
+    /* Per-PDU validity — false means that source PGN/frame has timed out, and
+     * the UI shows "---" for the corresponding value(s). */
+    struct {
+        bool engine_rapid;   /* PGN 127488: rpm, map_kpa */
+        bool engine_dyn;     /* PGN 127489: oil/coolant/battery/fuel/hours/pressures */
+        bool iat;            /* PGN 127493: iat_c */
+        bool lambda1;        /* raw CAN 0x180 */
+        bool lambda2;        /* raw CAN 0x181 */
+        bool position;       /* PGN 129025: latitude, longitude */
+        bool cogsog;         /* PGN 129026: sog_knots, cog_degrees */
+        bool depth;          /* PGN 128267: depth_m */
+        bool heading;        /* PGN 127250: heading_degrees */
+        bool water_temp;     /* PGN 130312: water_temp_c */
+    } valid;
 } gauge_data_t;
 
 #ifdef __cplusplus
