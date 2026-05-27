@@ -26,6 +26,18 @@ void screen_manager_create(void);
 void screen_manager_set_demo(bool demo);
 
 /**
+ * Platform hooks the settings screen calls to apply + persist changes.
+ * The shared UI stays hardware-agnostic; the firmware backs these with the
+ * backlight / data source / NVS, the simulator with stubs.
+ * Call before screen_manager_create() so the controls start at init values.
+ */
+typedef struct {
+    void (*set_brightness)(uint8_t pct);   /* backlight %, 1-100 */
+    void (*set_demo)(bool demo);           /* select demo vs live data */
+} screen_hooks_t;
+void screen_manager_set_hooks(const screen_hooks_t* hooks, uint8_t init_brightness, bool init_demo);
+
+/**
  * Update all screens with current gauge data.
  */
 void screen_manager_update(const gauge_data_t* data);

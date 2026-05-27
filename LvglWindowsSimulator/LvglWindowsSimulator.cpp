@@ -56,6 +56,10 @@ static void sim_data_init(void)
     sim_data.valid.heading = sim_data.valid.water_temp = true;
 }
 
+/* Settings hooks — no backlight or NVS in the simulator. */
+static void sim_set_brightness(uint8_t pct) { (void)pct; }
+static void sim_set_demo(bool demo) { (void)demo; }
+
 static void sim_data_update(void)
 {
     sim_tick++;
@@ -218,6 +222,8 @@ int main()
     sim_data_init();
     screen_manager_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
     screen_manager_set_alt_tile_path("C:/Data/marine-gauge/tools/MAP_DARK");
+    screen_hooks_t hooks = { sim_set_brightness, sim_set_demo };
+    screen_manager_set_hooks(&hooks, 100, true);
     screen_manager_create();
     screen_manager_set_demo(true);   /* simulator always runs on simulated data */
     screen_manager_update(&sim_data);

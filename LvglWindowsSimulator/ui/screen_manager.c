@@ -19,7 +19,13 @@ static lv_obj_t* tileview;
 static lv_obj_t* demo_badge = NULL;   /* "DEMO" badge, shown when on simulated data */
 static int32_t current_screen = 0;
 static bool swiping = false;       /* true during tileview scroll animation */
-#define NUM_SCREENS 3
+#define NUM_SCREENS 4
+
+/* Settings screen (tile 3) */
+static screen_hooks_t s_hooks;
+static uint8_t s_init_brightness = 100;
+static bool    s_init_demo = true;
+static lv_obj_t* s4_bright_val;
 
 /* Shared tile cache for all map renderers */
 static tile_cache_t* g_tile_cache = NULL;
@@ -161,6 +167,73 @@ static void create_screen3(lv_obj_t* tile)
     s3_hours_label = create_big_value(tile, col2, row_start + row_h * 5,  "Engine Hours", "---");
 }
 
+/* ── Screen 4: Settings ── */
+
+static void bright_slider_cb(lv_event_t* e)
+{
+    lv_obj_t* sl = (lv_obj_t*)lv_event_get_target(e);
+    int32_t v = lv_slider_get_value(sl);
+    if (v < 1) v = 1;
+    char b[16];
+    snprintf(b, sizeof(b), "%d%%", (int)v);
+    lv_label_set_text(s4_bright_val, b);
+    if (s_hooks.set_brightness) s_hooks.set_brightness((uint8_t)v);
+}
+
+static void demo_switch_cb(lv_event_t* e)
+{
+    lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
+    bool demo = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    screen_manager_set_demo(demo);            /* DEMO badge */
+    if (s_hooks.set_demo) s_hooks.set_demo(demo);
+}
+
+static void create_screen4(lv_obj_t* tile)
+{
+    lv_obj_set_style_bg_color(tile, COL_BG, 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+
+    lv_obj_t* title = lv_label_create(tile);
+    lv_label_set_text(title, "SETTINGS");
+    lv_obj_set_style_text_color(title, COL_TEXT_DIM, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+
+    /* Brightness */
+    lv_obj_t* bl = lv_label_create(tile);
+    lv_label_set_text(bl, "Brightness");
+    lv_obj_set_style_text_color(bl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_24, 0);
+    lv_obj_align(bl, LV_ALIGN_CENTER, 0, -130);
+
+    lv_obj_t* sl = lv_slider_create(tile);
+    lv_obj_set_size(sl, 340, 18);
+    lv_slider_set_range(sl, 1, 100);
+    lv_slider_set_value(sl, s_init_brightness, LV_ANIM_OFF);
+    lv_obj_align(sl, LV_ALIGN_CENTER, 0, -80);
+    lv_obj_add_event_cb(sl, bright_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    s4_bright_val = lv_label_create(tile);
+    char b[16];
+    snprintf(b, sizeof(b), "%d%%", (int)s_init_brightness);
+    lv_label_set_text(s4_bright_val, b);
+    lv_obj_set_style_text_color(s4_bright_val, COL_TEXT, 0);
+    lv_obj_set_style_text_font(s4_bright_val, &lv_font_montserrat_20, 0);
+    lv_obj_align(s4_bright_val, LV_ALIGN_CENTER, 0, -45);
+
+    /* Data source: demo vs live */
+    lv_obj_t* dl = lv_label_create(tile);
+    lv_label_set_text(dl, "Demo data");
+    lv_obj_set_style_text_color(dl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_24, 0);
+    lv_obj_align(dl, LV_ALIGN_CENTER, -70, 40);
+
+    lv_obj_t* sw = lv_switch_create(tile);
+    lv_obj_align(sw, LV_ALIGN_CENTER, 90, 40);
+    if (s_init_demo) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, demo_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
 /* Tileview scroll events — freeze updates during swipe transitions */
 static void tileview_scroll_begin_cb(lv_event_t* e)
 {
@@ -243,8 +316,12 @@ void screen_manager_create(void)
     create_screen2(t1);
 
     /* Tile 2: Engine detail */
-    lv_obj_t* t2 = lv_tileview_add_tile(tileview, 2, 0, LV_DIR_LEFT);
+    lv_obj_t* t2 = lv_tileview_add_tile(tileview, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     create_screen3(t2);
+
+    /* Tile 3: Settings */
+    lv_obj_t* t3 = lv_tileview_add_tile(tileview, 3, 0, LV_DIR_LEFT);
+    create_screen4(t3);
 
     /* Warning overlay — sibling of tileview, inside circle mask, on top of everything */
     warning_overlay_init(circle);
@@ -283,6 +360,13 @@ void screen_manager_set_demo(bool demo)
     if (!demo_badge) return;
     if (demo) lv_obj_remove_flag(demo_badge, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_add_flag(demo_badge, LV_OBJ_FLAG_HIDDEN);
+}
+
+void screen_manager_set_hooks(const screen_hooks_t* hooks, uint8_t init_brightness, bool init_demo)
+{
+    if (hooks) s_hooks = *hooks;
+    s_init_brightness = init_brightness;
+    s_init_demo = init_demo;
 }
 
 void screen_manager_update(const gauge_data_t* d)
