@@ -893,9 +893,9 @@ void golden_screen_update(const gauge_data_t* d)
     char buf[32];
 
 #ifdef COMET_DISABLE
-    /* Ring-band needle — throttled, relative coords for tight invalidation */
+    /* Ring-band needle — updates every UI tick on RPM change (relative coords
+     * keep invalidation tight). Data is fed by a Core-0 task, so it stays smooth. */
     {
-        static uint32_t needle_frame = 0;
         static int32_t needle_last_rpm = -1;
         int32_t rpm_int = (int32_t)d->rpm;
         /* Hide the needle entirely when the RPM PDU (127488) has timed out. */
@@ -906,8 +906,7 @@ void golden_screen_update(const gauge_data_t* d)
             lv_obj_remove_flag(needle_line, LV_OBJ_FLAG_HIDDEN);
             needle_last_rpm = -1;  /* force a redraw now that it is visible again */
         }
-        if (d->valid.engine_rapid && rpm_int != needle_last_rpm && ++needle_frame >= 3) {
-            needle_frame = 0;
+        if (d->valid.engine_rapid && rpm_int != needle_last_rpm) {
             needle_last_rpm = rpm_int;
 
             float angle_deg = 135.0f + (d->rpm / (float)RPM_MAX) * 270.0f;
