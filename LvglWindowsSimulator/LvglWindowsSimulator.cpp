@@ -100,8 +100,8 @@ static void sim_data_update(void)
 
     /* GPS: slow circle near Punat (~0.01 deg radius ≈ 1km) */
     float gps_t = t * 0.05f;
-    sim_data.latitude  = 45.00 + 0.01 * sin(gps_t);
-    sim_data.longitude = 14.61 + 0.01 * cos(gps_t);
+    sim_data.latitude  = 45.00 + 0.05 * sin(gps_t);   /* ~290px radius: crosses the map deadband */
+    sim_data.longitude = 14.61 + 0.05 * cos(gps_t);
     sim_data.cog_degrees = fmodf(90.0f - gps_t * 180.0f / 3.14159f, 360.0f);
     if (sim_data.cog_degrees < 0) sim_data.cog_degrees += 360.0f;
 

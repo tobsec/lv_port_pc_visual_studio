@@ -81,8 +81,11 @@ static lv_obj_t* create_big_value(lv_obj_t* parent, int32_t x, int32_t y,
 /* Label = formatted value, or a "---" placeholder when the source PDU is stale. */
 static void set_val(lv_obj_t* lbl, bool valid, const char* fmt, double v, const char* dash)
 {
-    if (valid) { char b[32]; snprintf(b, sizeof(b), fmt, v); lv_label_set_text(lbl, b); }
-    else lv_label_set_text(lbl, dash);
+    char b[32];
+    if (valid) snprintf(b, sizeof(b), fmt, v);
+    else       snprintf(b, sizeof(b), "%s", dash);
+    const char* cur = lv_label_get_text(lbl);   /* skip if the text is unchanged */
+    if (!cur || strcmp(cur, b) != 0) lv_label_set_text(lbl, b);
 }
 
 /* ── Screen 2: Full Chart ── */

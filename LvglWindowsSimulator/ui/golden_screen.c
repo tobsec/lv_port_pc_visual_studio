@@ -75,6 +75,7 @@ typedef struct {
     lv_obj_t* val;    /* value label */
     lv_obj_t* unit;   /* unit label (smaller, dimmer) */
     lv_obj_t* bar;    /* thin range bar */
+    int8_t    alert;  /* last applied state: 0 uninit, 1 normal, 2 yellow, 3 red */
 } gauge_pod_t;
 
 static gauge_pod_t pod_oilt, pod_oilp, pod_clt;
@@ -518,23 +519,31 @@ static void create_pod(lv_obj_t* parent, int32_t x, int32_t y, int32_t w, int32_
     out->bar = bar;
 }
 
-/* Update pod alert state: changes border, value text, bar, and dot color */
+/* Update pod alert state: changes border, value text, bar, and dot color.
+ * Skips re-applying the same state (avoids needless invalidation/redraw). */
 static void pod_set_alert(gauge_pod_t* p, lv_color_t color)
 {
+    int8_t lvl = lv_color_eq(color, COL_RED) ? 3 : 2;   /* red=3, yellow=2 */
+    if (p->alert == lvl) return;
+    p->alert = lvl;
     lv_obj_set_style_border_color(p->pod, color, 0);
     lv_obj_set_style_text_color(p->val, color, 0);
     lv_obj_set_style_bg_color(p->bar, color, LV_PART_INDICATOR);
 }
 
-/* Update pod value and realign unit label */
+/* Update pod value and realign unit label (skips when text is unchanged). */
 static void pod_update_val(gauge_pod_t* p, const char* text)
 {
+    const char* cur = lv_label_get_text(p->val);
+    if (cur && strcmp(cur, text) == 0) return;
     lv_label_set_text(p->val, text);
     if (p->unit) lv_obj_align_to(p->unit, p->val, LV_ALIGN_OUT_RIGHT_BOTTOM, 3, -2);
 }
 
 static void pod_set_normal(gauge_pod_t* p)
 {
+    if (p->alert == 1) return;
+    p->alert = 1;
     lv_obj_set_style_border_color(p->pod, COL_POD_BORDER, 0);
     lv_obj_set_style_text_color(p->val, COL_TEXT, 0);
     lv_obj_set_style_bg_color(p->bar, COL_NORMAL, LV_PART_INDICATOR);
@@ -554,8 +563,11 @@ static lv_obj_t* create_readout(lv_obj_t* parent, int32_t x, int32_t y, const ch
 /* Label = formatted value, or a "---" placeholder when the source PDU is stale. */
 static void set_val(lv_obj_t* lbl, bool valid, const char* fmt, double v, const char* dash)
 {
-    if (valid) { char b[32]; snprintf(b, sizeof(b), fmt, v); lv_label_set_text(lbl, b); }
-    else lv_label_set_text(lbl, dash);
+    char b[32];
+    if (valid) snprintf(b, sizeof(b), fmt, v);
+    else       snprintf(b, sizeof(b), "%s", dash);
+    const char* cur = lv_label_get_text(lbl);   /* skip if the text is unchanged */
+    if (!cur || strcmp(cur, b) != 0) lv_label_set_text(lbl, b);
 }
 
 /* Pod showing stale data: dash placeholder, cleared bar, normal styling. */
