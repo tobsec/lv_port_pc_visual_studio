@@ -208,7 +208,8 @@ static void create_screen4(lv_obj_t* tile)
 
     lv_obj_t* sl = lv_slider_create(tile);
     lv_obj_set_size(sl, 340, 18);
-    lv_slider_set_range(sl, 1, 100);
+    /* Below ~21% the panel backlight goes dark, so 21% is the usable minimum. */
+    lv_slider_set_range(sl, 21, 100);
     lv_slider_set_value(sl, s_init_brightness, LV_ANIM_OFF);
     lv_obj_align(sl, LV_ALIGN_CENTER, 0, -80);
     lv_obj_add_event_cb(sl, bright_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
