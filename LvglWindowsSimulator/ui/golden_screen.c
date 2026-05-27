@@ -650,7 +650,8 @@ void golden_screen_create(lv_obj_t* parent)
     if (tile_path) {
         gs_map = map_renderer_create(chart_area, tile_path, 600);
         if (gs_map) {
-            map_renderer_set_view(gs_map, 45.00, 14.61, 13);
+            /* View is set later by screen_manager once the cache exists, so tile
+             * loading is async (no blocking SD reads during boot). */
             /* Vignette disabled — pixel-by-pixel alpha blend is too expensive on ESP32 */
             /* map_renderer_set_vignette(gs_map, 0.65f, COL_BG); */
             map_renderer_create_track_btn(gs_map, root, 220, 60);

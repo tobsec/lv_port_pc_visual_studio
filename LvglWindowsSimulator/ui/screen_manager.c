@@ -101,7 +101,7 @@ static void create_screen2(lv_obj_t* tile)
     if (tile_path) {
         s2_map = map_renderer_create(chart_area, tile_path, DISP_SIZE);
         if (s2_map) {
-            map_renderer_set_view(s2_map, 45.00, 14.61, 13);
+            /* View set later (after the cache exists) so tiles load async. */
             map_renderer_create_track_btn(s2_map, tile, 250, 200);
             if (alt_tile_path) {
                 map_renderer_set_alt_tiles(s2_map, alt_tile_path, tile, -250, 200);
@@ -449,8 +449,16 @@ void screen_manager_create(void)
         g_tile_cache = tile_cache_create(64);  /* 64 tiles × 128 KB = 8 MB */
         if (g_tile_cache) {
             map_renderer_t* gs_map = golden_screen_get_map();
-            if (gs_map) map_renderer_set_cache(gs_map, g_tile_cache);
-            if (s2_map) map_renderer_set_cache(s2_map, g_tile_cache);
+            /* Attach cache, then set the view — tiles are requested via the
+             * background loader (async), so the UI appears before they arrive. */
+            if (gs_map) {
+                map_renderer_set_cache(gs_map, g_tile_cache);
+                map_renderer_set_view(gs_map, 45.00, 14.61, 13);
+            }
+            if (s2_map) {
+                map_renderer_set_cache(s2_map, g_tile_cache);
+                map_renderer_set_view(s2_map, 45.00, 14.61, 13);
+            }
             tile_cache_start_loader(g_tile_cache);
             lv_timer_create(tile_ready_timer_cb, 500, NULL);  /* 2 Hz poll */
         }

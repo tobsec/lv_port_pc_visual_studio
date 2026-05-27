@@ -463,7 +463,9 @@ void map_renderer_set_view(map_renderer_t* mr, double lat, double lon, int32_t z
     mr->grid_origin_tx = (int32_t)floor(mr->center_tx) - GRID_COLS / 2;
     mr->grid_origin_ty = (int32_t)floor(mr->center_ty) - GRID_ROWS / 2;
 
-    /* Sync-load visible tiles into cache */
+#ifndef ESP_PLATFORM
+    /* Simulator has no background tile loader, so load the visible grid
+     * synchronously here. (On target this is async — see below.) */
     if (mr->cache) {
         for (int32_t row = 0; row < GRID_ROWS; row++)
             for (int32_t col = 0; col < GRID_COLS; col++) {
@@ -473,7 +475,10 @@ void map_renderer_set_view(map_renderer_t* mr, double lat, double lon, int32_t z
                 tile_cache_load_sync(mr->cache, key, mr->tile_base);
             }
     }
-
+#endif
+    /* On target, load_grid_tiles() requests cache misses via the background
+     * loader (async) and shows placeholders until they arrive — no blocking SD
+     * reads during boot. */
     load_grid_tiles(mr);
     center_scroll_on_view(mr);
     update_marker_position(mr);
@@ -614,18 +619,8 @@ void map_renderer_set_cache(map_renderer_t* mr, tile_cache_t* cache)
         mr->path_id_alt = tile_cache_register_path(cache, mr->tile_alt);
         if (mr->using_alt) mr->path_id = mr->path_id_alt;
     }
-
-    /* Pre-populate cache with grid tiles */
-    for (int32_t row = 0; row < GRID_ROWS; row++)
-        for (int32_t col = 0; col < GRID_COLS; col++) {
-            tile_key_t key = { mr->path_id, (uint8_t)mr->current_zoom,
-                               (uint16_t)(mr->grid_origin_tx + col),
-                               (uint16_t)(mr->grid_origin_ty + row) };
-            tile_cache_load_sync(mr->cache, key, mr->tile_base);
-        }
-
-    /* Reload grid now that cache is populated */
-    load_grid_tiles(mr);
+    /* No blocking prepopulate — the caller's map_renderer_set_view() requests
+     * the visible tiles asynchronously via the background loader. */
 }
 
 void map_renderer_render(map_renderer_t* mr)
