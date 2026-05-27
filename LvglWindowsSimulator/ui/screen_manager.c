@@ -26,6 +26,9 @@ static screen_hooks_t s_hooks;
 static uint8_t s_init_brightness = 100;
 static bool    s_init_demo = true;
 static lv_obj_t* s4_bright_val;
+static warn_thresholds_t s_thr_vals;
+static bool s_thr_set = false;
+static lv_obj_t* thr_val_lbl[THR_COUNT];
 
 /* Shared tile cache for all map renderers */
 static tile_cache_t* g_tile_cache = NULL;
@@ -169,11 +172,34 @@ static void create_screen3(lv_obj_t* tile)
 
 /* ── Screen 4: Settings ── */
 
+/* Editable threshold descriptors, indexed by thr_id_t. */
+typedef struct {
+    const char* label;
+    uint16_t min, max, step;
+    float    scale;     /* stored value * scale = displayed number */
+    uint8_t  decimals;
+    const char* unit;
+} thr_desc_t;
+
+static const thr_desc_t THR_DESC[THR_COUNT] = {
+    /* RPM_REDLINE  */ { "RPM redline",  4000, 7000, 100, 1.0f,  0, "" },
+    /* OIL_TEMP_MAX */ { "Oil temp max", 100,  150,  5,   1.0f,  0, " \xC2\xB0""C" },
+    /* CLT_TEMP_MAX */ { "Coolant max",  60,   110,  5,   1.0f,  0, " \xC2\xB0""C" },
+    /* OIL_PRESS_MIN*/ { "Oil press min",50,   400,  10,  0.01f, 1, " bar" },
+    /* DEPTH_MIN    */ { "Shallow water",50,   1000, 50,  0.01f, 1, " m" },
+};
+
+static void fmt_thr(char* buf, size_t n, int id)
+{
+    const thr_desc_t* d = &THR_DESC[id];
+    snprintf(buf, n, "%.*f%s", d->decimals, s_thr_vals.v[id] * d->scale, d->unit);
+}
+
 static void bright_slider_cb(lv_event_t* e)
 {
     lv_obj_t* sl = (lv_obj_t*)lv_event_get_target(e);
     int32_t v = lv_slider_get_value(sl);
-    if (v < 1) v = 1;
+    if (v < 21) v = 21;
     char b[16];
     snprintf(b, sizeof(b), "%d%%", (int)v);
     lv_label_set_text(s4_bright_val, b);
@@ -188,51 +214,121 @@ static void demo_switch_cb(lv_event_t* e)
     if (s_hooks.set_demo) s_hooks.set_demo(demo);
 }
 
+static void thr_step(int id, int dir)
+{
+    const thr_desc_t* d = &THR_DESC[id];
+    int32_t nv = (int32_t)s_thr_vals.v[id] + dir * (int32_t)d->step;
+    if (nv < d->min) nv = d->min;
+    if (nv > d->max) nv = d->max;
+    s_thr_vals.v[id] = (uint16_t)nv;
+
+    char b[24];
+    fmt_thr(b, sizeof(b), id);
+    lv_label_set_text(thr_val_lbl[id], b);
+
+    warning_overlay_set_thresholds(&s_thr_vals);            /* apply now */
+    if (s_hooks.set_threshold) s_hooks.set_threshold(id, s_thr_vals.v[id]);  /* persist */
+}
+
+static void thr_dec_cb(lv_event_t* e) { thr_step((int)(intptr_t)lv_event_get_user_data(e), -1); }
+static void thr_inc_cb(lv_event_t* e) { thr_step((int)(intptr_t)lv_event_get_user_data(e), +1); }
+
+/* One threshold row: "Label            value [-][+]" */
+static void create_thr_row(lv_obj_t* parent, int id)
+{
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_set_size(row, 560, 48);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, THR_DESC[id].label);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    thr_val_lbl[id] = lv_label_create(row);
+    char b[24];
+    fmt_thr(b, sizeof(b), id);
+    lv_label_set_text(thr_val_lbl[id], b);
+    lv_obj_set_style_text_color(thr_val_lbl[id], COL_TEXT, 0);
+    lv_obj_set_style_text_font(thr_val_lbl[id], &lv_font_montserrat_20, 0);
+    lv_obj_align(thr_val_lbl[id], LV_ALIGN_RIGHT_MID, -120, 0);
+
+    lv_obj_t* minus = lv_button_create(row);
+    lv_obj_set_size(minus, 48, 44);
+    lv_obj_align(minus, LV_ALIGN_RIGHT_MID, -56, 0);
+    lv_obj_add_event_cb(minus, thr_dec_cb, LV_EVENT_CLICKED, (void*)(intptr_t)id);
+    lv_obj_t* ml = lv_label_create(minus); lv_label_set_text(ml, "-"); lv_obj_center(ml);
+
+    lv_obj_t* plus = lv_button_create(row);
+    lv_obj_set_size(plus, 48, 44);
+    lv_obj_align(plus, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_event_cb(plus, thr_inc_cb, LV_EVENT_CLICKED, (void*)(intptr_t)id);
+    lv_obj_t* pl = lv_label_create(plus); lv_label_set_text(pl, "+"); lv_obj_center(pl);
+}
+
 static void create_screen4(lv_obj_t* tile)
 {
     lv_obj_set_style_bg_color(tile, COL_BG, 0);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
 
-    lv_obj_t* title = lv_label_create(tile);
+    /* Vertical column, centred, sized to its content (no scrolling needed). */
+    lv_obj_t* col = lv_obj_create(tile);
+    lv_obj_set_width(col, 600);
+    lv_obj_set_height(col, LV_SIZE_CONTENT);
+    lv_obj_center(col);
+    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_pad_all(col, 0, 0);
+    lv_obj_set_style_pad_row(col, 10, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(col);
     lv_label_set_text(title, "SETTINGS");
     lv_obj_set_style_text_color(title, COL_TEXT_DIM, 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
 
     /* Brightness */
-    lv_obj_t* bl = lv_label_create(tile);
-    lv_label_set_text(bl, "Brightness");
-    lv_obj_set_style_text_color(bl, COL_TEXT, 0);
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_24, 0);
-    lv_obj_align(bl, LV_ALIGN_CENTER, 0, -130);
-
-    lv_obj_t* sl = lv_slider_create(tile);
-    lv_obj_set_size(sl, 340, 18);
+    lv_obj_t* sl = lv_slider_create(col);
+    lv_obj_set_size(sl, 360, 18);
     /* Below ~21% the panel backlight goes dark, so 21% is the usable minimum. */
     lv_slider_set_range(sl, 21, 100);
     lv_slider_set_value(sl, s_init_brightness, LV_ANIM_OFF);
-    lv_obj_align(sl, LV_ALIGN_CENTER, 0, -80);
     lv_obj_add_event_cb(sl, bright_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    s4_bright_val = lv_label_create(tile);
+    s4_bright_val = lv_label_create(col);
     char b[16];
-    snprintf(b, sizeof(b), "%d%%", (int)s_init_brightness);
+    snprintf(b, sizeof(b), "Brightness %d%%", (int)s_init_brightness);
     lv_label_set_text(s4_bright_val, b);
     lv_obj_set_style_text_color(s4_bright_val, COL_TEXT, 0);
-    lv_obj_set_style_text_font(s4_bright_val, &lv_font_montserrat_20, 0);
-    lv_obj_align(s4_bright_val, LV_ALIGN_CENTER, 0, -45);
+    lv_obj_set_style_text_font(s4_bright_val, &lv_font_montserrat_18, 0);
 
-    /* Data source: demo vs live */
-    lv_obj_t* dl = lv_label_create(tile);
+    /* Demo / live row */
+    lv_obj_t* drow = lv_obj_create(col);
+    lv_obj_set_size(drow, 560, 48);
+    lv_obj_set_style_bg_opa(drow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(drow, 0, 0);
+    lv_obj_set_style_pad_all(drow, 0, 0);
+    lv_obj_remove_flag(drow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* dl = lv_label_create(drow);
     lv_label_set_text(dl, "Demo data");
     lv_obj_set_style_text_color(dl, COL_TEXT, 0);
-    lv_obj_set_style_text_font(dl, &lv_font_montserrat_24, 0);
-    lv_obj_align(dl, LV_ALIGN_CENTER, -70, 40);
-
-    lv_obj_t* sw = lv_switch_create(tile);
-    lv_obj_align(sw, LV_ALIGN_CENTER, 90, 40);
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_20, 0);
+    lv_obj_align(dl, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t* sw = lv_switch_create(drow);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
     if (s_init_demo) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, demo_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Editable warning thresholds */
+    for (int i = 0; i < THR_COUNT; i++) create_thr_row(col, i);
 }
 
 /* Tileview scroll events — freeze updates during swipe transitions */
@@ -308,6 +404,8 @@ void screen_manager_create(void)
     lv_obj_add_event_cb(tileview, tileview_scroll_begin_cb, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(tileview, tileview_scroll_end_cb, LV_EVENT_SCROLL_END, NULL);
 
+    if (!s_thr_set) warn_thresholds_defaults(&s_thr_vals);
+
     /* Tile 0: Golden screen (main) */
     lv_obj_t* t0 = lv_tileview_add_tile(tileview, 0, 0, LV_DIR_RIGHT);
     golden_screen_create(t0);
@@ -326,6 +424,7 @@ void screen_manager_create(void)
 
     /* Warning overlay — sibling of tileview, inside circle mask, on top of everything */
     warning_overlay_init(circle);
+    warning_overlay_set_thresholds(&s_thr_vals);   /* apply persisted thresholds */
 
     /* Debug tick counter — on top of everything */
     golden_screen_show_tick_counter(circle);
@@ -368,6 +467,16 @@ void screen_manager_set_hooks(const screen_hooks_t* hooks, uint8_t init_brightne
     if (hooks) s_hooks = *hooks;
     s_init_brightness = init_brightness;
     s_init_demo = init_demo;
+}
+
+void screen_manager_set_thresholds(const warn_thresholds_t* t)
+{
+    if (!t) return;
+    s_thr_vals = *t;
+    s_thr_set = true;
+    for (int i = 0; i < THR_COUNT; i++) {
+        if (thr_val_lbl[i]) { char b[24]; fmt_thr(b, sizeof(b), i); lv_label_set_text(thr_val_lbl[i], b); }
+    }
 }
 
 void screen_manager_update(const gauge_data_t* d)

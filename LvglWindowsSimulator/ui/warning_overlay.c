@@ -44,6 +44,7 @@ typedef struct {
 } warning_state_t;
 
 static warning_state_t warnings[WID_COUNT];
+static warn_thresholds_t s_thr;   /* user-tunable thresholds (set via API) */
 
 /* ── Overlay widgets ── */
 static lv_obj_t* overlay_scrim;
@@ -68,6 +69,7 @@ static int32_t shown_warning_id = -1;
 static void init_warnings(void)
 {
     memset(warnings, 0, sizeof(warnings));
+    warn_thresholds_defaults(&s_thr);
 
     /* Engine CAN timeout is a normal condition when the ignition is off (ECU
      * unpowered), so it's a warning, not a red critical. */
@@ -377,20 +379,23 @@ void warning_overlay_update(const gauge_data_t* d)
         debounce_warning(&warnings[WID_EMERGENCY_STOP],
             (d->map_kpa < 1.0f || d->map_kpa >= 101.0f) && d->battery_voltage > 7.0f, now);
 
+        float oil_max = s_thr.v[THR_OIL_TEMP_MAX];
         snprintf(warnings[WID_OVERTEMP_OIL].detail, sizeof(warnings[0].detail),
-            "Oil %.0f°C - max 125°C", d->oil_temp_c);
+            "Oil %.0f°C - max %.0f°C", d->oil_temp_c, oil_max);
         debounce_warning(&warnings[WID_OVERTEMP_OIL],
-            hyst_above(d->oil_temp_c, 125, 120, warnings[WID_OVERTEMP_OIL].active), now);
+            hyst_above(d->oil_temp_c, oil_max, oil_max - 5, warnings[WID_OVERTEMP_OIL].active), now);
 
+        float clt_max = s_thr.v[THR_CLT_TEMP_MAX];
         snprintf(warnings[WID_OVERTEMP_CLT].detail, sizeof(warnings[0].detail),
-            "Coolant %.0f°C - max 85°C", d->coolant_temp_c);
+            "Coolant %.0f°C - max %.0f°C", d->coolant_temp_c, clt_max);
         debounce_warning(&warnings[WID_OVERTEMP_CLT],
-            hyst_above(d->coolant_temp_c, 85, 80, warnings[WID_OVERTEMP_CLT].active), now);
+            hyst_above(d->coolant_temp_c, clt_max, clt_max - 5, warnings[WID_OVERTEMP_CLT].active), now);
 
+        float oil_min = s_thr.v[THR_OIL_PRESS_MIN];
         snprintf(warnings[WID_LOW_OIL_PRESS].detail, sizeof(warnings[0].detail),
-            "%.1f bar - min 1.5 bar", d->oil_pressure_kpa / 100.0f);
+            "%.1f bar - min %.1f bar", d->oil_pressure_kpa / 100.0f, oil_min / 100.0f);
         debounce_warning(&warnings[WID_LOW_OIL_PRESS],
-            d->rpm > 400 && hyst_below(d->oil_pressure_kpa, 150, 165,
+            d->rpm > 400 && hyst_below(d->oil_pressure_kpa, oil_min, oil_min + 15,
                 warnings[WID_LOW_OIL_PRESS].active), now);
 
         snprintf(warnings[WID_LOW_VOLTAGE].detail, sizeof(warnings[0].detail),
@@ -416,10 +421,11 @@ void warning_overlay_update(const gauge_data_t* d)
         debounce_warning(&warnings[WID_LAMBDA_OOR],
             warnings[WID_LAMBDA_OOR].active ? !lam_clear : lam_trigger, now);
 
+        float rpm_max = s_thr.v[THR_RPM_REDLINE];
         snprintf(warnings[WID_RPM_REDLINE].detail, sizeof(warnings[0].detail),
-            "%.0f RPM - max 5200", d->rpm);
+            "%.0f RPM - max %.0f", d->rpm, rpm_max);
         debounce_warning(&warnings[WID_RPM_REDLINE],
-            hyst_above(d->rpm, 5200, 5000, warnings[WID_RPM_REDLINE].active), now);
+            hyst_above(d->rpm, rpm_max, rpm_max - 200, warnings[WID_RPM_REDLINE].active), now);
     }
 
     /* Nav CAN */
@@ -437,10 +443,11 @@ void warning_overlay_update(const gauge_data_t* d)
             }
         }
     } else {
+        float depth_min = s_thr.v[THR_DEPTH_MIN] / 100.0f;   /* cm → m */
         snprintf(warnings[WID_DEPTH_LOW].detail, sizeof(warnings[0].detail),
-            "%.1f m - min 2.0 m", d->depth_m);
+            "%.1f m - min %.1f m", d->depth_m, depth_min);
         debounce_warning(&warnings[WID_DEPTH_LOW],
-            hyst_below(d->depth_m, 2.0f, 2.5f, warnings[WID_DEPTH_LOW].active), now);
+            hyst_below(d->depth_m, depth_min, depth_min + 0.5f, warnings[WID_DEPTH_LOW].active), now);
     }
 
     /* Info warnings are dismissed by ACK (like warnings), not on a timer —
@@ -493,6 +500,11 @@ void warning_overlay_update(const gauge_data_t* d)
             }
         }
     }
+}
+
+void warning_overlay_set_thresholds(const warn_thresholds_t* t)
+{
+    if (t) s_thr = *t;
 }
 
 void warning_overlay_ack(void)

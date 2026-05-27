@@ -3,6 +3,7 @@
 
 #include "lvgl/lvgl.h"
 #include "gauge_data.h"
+#include "warn_thresholds.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,10 +33,15 @@ void screen_manager_set_demo(bool demo);
  * Call before screen_manager_create() so the controls start at init values.
  */
 typedef struct {
-    void (*set_brightness)(uint8_t pct);   /* backlight %, 1-100 */
-    void (*set_demo)(bool demo);           /* select demo vs live data */
+    void (*set_brightness)(uint8_t pct);          /* backlight %, 1-100 */
+    void (*set_demo)(bool demo);                  /* select demo vs live data */
+    void (*set_threshold)(int id, uint16_t val);  /* persist a warning threshold (thr_id_t) */
 } screen_hooks_t;
 void screen_manager_set_hooks(const screen_hooks_t* hooks, uint8_t init_brightness, bool init_demo);
+
+/* Provide the initial warning thresholds for the settings editor (applies to
+ * the warning overlay too). Call before screen_manager_create(). */
+void screen_manager_set_thresholds(const warn_thresholds_t* t);
 
 /**
  * Update all screens with current gauge data.
