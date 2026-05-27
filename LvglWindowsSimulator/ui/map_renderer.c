@@ -201,11 +201,11 @@ static void update_marker_position(map_renderer_t* mr)
     double ptx, pty;
     lat_lon_to_tile(mr->pos_lat, mr->pos_lon, mr->current_zoom, &ptx, &pty);
 
-    /* Position in map_group pixel coordinates */
-    int32_t mx = (int32_t)((ptx - mr->grid_origin_tx) * TILE_PX);
-    int32_t my = (int32_t)((pty - mr->grid_origin_ty) * TILE_PX);
-
-    /* Position the marker centered on this point */
+    /* Screen position, matching apply_pan_offset(): map content at tile-coord T
+     * is drawn at vp/2 + (T - center)*TILE_PX. So the vessel sits at viewport
+     * centre when centred, and drifts from centre within the deadband. */
+    int32_t mx = mr->vp_size / 2 + (int32_t)((ptx - mr->center_tx) * TILE_PX);
+    int32_t my = mr->vp_size / 2 + (int32_t)((pty - mr->center_ty) * TILE_PX);
     lv_obj_set_pos(mr->marker_img, mx - MARKER_SIZE / 2, my - MARKER_SIZE / 2);
 
     /* Clear marker canvas to transparent */
@@ -421,6 +421,21 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
         lv_obj_remove_flag(mr->tile_widgets[i], LV_OBJ_FLAG_SCROLLABLE);
     }
 
+    /* Position marker (vessel arrow), created after the tiles so it draws on
+     * top. Small ARGB8888 image (MARKER_SIZE px) so the per-update blend is
+     * cheap. update_marker_position() draws the COG-oriented triangle. */
+    mr->marker_buf = (uint8_t*)malloc(MARKER_SIZE * MARKER_SIZE * 4);
+    if (mr->marker_buf) {
+        memset(mr->marker_buf, 0, MARKER_SIZE * MARKER_SIZE * 4);
+        lv_draw_buf_init(&mr->marker_dbuf, MARKER_SIZE, MARKER_SIZE,
+            LV_COLOR_FORMAT_ARGB8888, 0, mr->marker_buf, MARKER_SIZE * MARKER_SIZE * 4);
+        lv_draw_buf_set_flag(&mr->marker_dbuf, LV_IMAGE_FLAGS_MODIFIABLE);
+        mr->marker_img = lv_image_create(mr->map_group);
+        lv_image_set_src(mr->marker_img, &mr->marker_dbuf);
+        lv_obj_remove_flag(mr->marker_img, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(mr->marker_img, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
     /* Touch handling for the custom drag pan */
     #define PAN_EDGE_PX 100
     lv_obj_t* touch_target;
@@ -530,11 +545,23 @@ void map_renderer_set_position(map_renderer_t* mr, double lat, double lon, float
     mr->pos_valid = true;
 
     if (mr->tracking) {
-        mr->center_lat = lat;
-        mr->center_lon = lon;
-        update_tile_coords(mr);
-        center_scroll_on_view(mr);
-        check_grid_boundary(mr);
+        /* Deadband: keep the map still and only move the marker while the vessel
+         * stays within the central band; re-center (re-render the tile grid)
+         * once it drifts past the threshold. Avoids re-rendering the map for
+         * every small position change. */
+        double ptx, pty;
+        lat_lon_to_tile(lat, lon, mr->current_zoom, &ptx, &pty);
+        double off_x = (ptx - mr->center_tx) * TILE_PX;
+        double off_y = (pty - mr->center_ty) * TILE_PX;
+        double deadband = mr->vp_size * 0.30;   /* recenter past 30% from middle */
+        if (fabs(off_x) > deadband || fabs(off_y) > deadband) {
+            mr->center_lat = lat;
+            mr->center_lon = lon;
+            update_tile_coords(mr);
+            center_scroll_on_view(mr);   /* repositions tiles + marker */
+            check_grid_boundary(mr);
+            return;
+        }
     }
 
     update_marker_position(mr);
