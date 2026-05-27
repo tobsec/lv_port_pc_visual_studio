@@ -17,9 +17,11 @@ static const char* tile_path = NULL;
 static const char* alt_tile_path = NULL;
 static lv_obj_t* tileview;
 static lv_obj_t* demo_badge = NULL;   /* "DEMO" badge, shown when on simulated data */
-static int32_t current_screen = 0;
-static bool swiping = false;       /* true during tileview scroll animation */
 #define NUM_SCREENS 4
+/* Tile order, left → right. Settings sits left of the golden/home screen. */
+enum { SCREEN_SETTINGS = 0, SCREEN_GOLDEN, SCREEN_CHART, SCREEN_ENGINE };
+static int32_t current_screen = SCREEN_GOLDEN;   /* boot on the golden screen */
+static bool swiping = false;       /* true during tileview scroll animation */
 
 /* Settings screen (tile 3) */
 static screen_hooks_t s_hooks;
@@ -182,11 +184,11 @@ typedef struct {
 } thr_desc_t;
 
 static const thr_desc_t THR_DESC[THR_COUNT] = {
-    /* RPM_REDLINE  */ { "RPM redline",  4000, 7000, 100, 1.0f,  0, "" },
-    /* OIL_TEMP_MAX */ { "Oil temp max", 100,  150,  5,   1.0f,  0, " \xC2\xB0""C" },
-    /* CLT_TEMP_MAX */ { "Coolant max",  60,   110,  5,   1.0f,  0, " \xC2\xB0""C" },
+    /* RPM_REDLINE  */ { "RPM redline",  4000, 7000, 50,  1.0f,  0, "" },
+    /* OIL_TEMP_MAX */ { "Oil temp max", 100,  150,  1,   1.0f,  0, " \xC2\xB0""C" },
+    /* CLT_TEMP_MAX */ { "Coolant max",  60,   110,  1,   1.0f,  0, " \xC2\xB0""C" },
     /* OIL_PRESS_MIN*/ { "Oil press min",50,   400,  10,  0.01f, 1, " bar" },
-    /* DEPTH_MIN    */ { "Shallow water",50,   1000, 50,  0.01f, 1, " m" },
+    /* DEPTH_MIN    */ { "Shallow water",50,   1000, 10,  0.01f, 1, " m" },
 };
 
 static void fmt_thr(char* buf, size_t n, int id)
@@ -276,19 +278,22 @@ static void create_screen4(lv_obj_t* tile)
     lv_obj_set_style_bg_color(tile, COL_BG, 0);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
 
-    /* Vertical column, centred, sized to its content (no scrolling needed). */
+    /* Vertical, scrollable column kept inside the round display's safe band
+     * (centred 620x600 window) so 560-wide rows never hit the curved edges.
+     * Scrolls vertically as more settings are added; the tileview keeps the
+     * horizontal swipe. */
     lv_obj_t* col = lv_obj_create(tile);
-    lv_obj_set_width(col, 600);
-    lv_obj_set_height(col, LV_SIZE_CONTENT);
+    lv_obj_set_size(col, 620, 600);
     lv_obj_center(col);
     lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(col, 0, 0);
-    lv_obj_set_style_pad_all(col, 0, 0);
+    lv_obj_set_style_pad_all(col, 8, 0);
     lv_obj_set_style_pad_row(col, 10, 0);
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(col, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLL_CHAIN);
 
     lv_obj_t* title = lv_label_create(col);
     lv_label_set_text(title, "SETTINGS");
@@ -355,11 +360,11 @@ static void tile_ready_timer_cb(lv_timer_t* timer)
 {
     (void)timer;
     if (swiping || !g_tile_cache || !tile_cache_check_ready(g_tile_cache)) return;
-    if (current_screen == 0) {
+    if (current_screen == SCREEN_GOLDEN) {
         map_renderer_t* gs_map = golden_screen_get_map();
         if (gs_map) map_renderer_render(gs_map);
     }
-    if (current_screen == 1 && s2_map) map_renderer_render(s2_map);
+    if (current_screen == SCREEN_CHART && s2_map) map_renderer_render(s2_map);
 }
 
 /* ── Public API ── */
@@ -406,21 +411,18 @@ void screen_manager_create(void)
 
     if (!s_thr_set) warn_thresholds_defaults(&s_thr_vals);
 
-    /* Tile 0: Golden screen (main) */
-    lv_obj_t* t0 = lv_tileview_add_tile(tileview, 0, 0, LV_DIR_RIGHT);
-    golden_screen_create(t0);
+    /* Tile order: [settings] [golden] [chart] [engine] */
+    lv_obj_t* tset = lv_tileview_add_tile(tileview, SCREEN_SETTINGS, 0, LV_DIR_RIGHT);
+    create_screen4(tset);
 
-    /* Tile 1: Full chart */
-    lv_obj_t* t1 = lv_tileview_add_tile(tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    create_screen2(t1);
+    lv_obj_t* tg = lv_tileview_add_tile(tileview, SCREEN_GOLDEN, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    golden_screen_create(tg);
 
-    /* Tile 2: Engine detail */
-    lv_obj_t* t2 = lv_tileview_add_tile(tileview, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    create_screen3(t2);
+    lv_obj_t* tc = lv_tileview_add_tile(tileview, SCREEN_CHART, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    create_screen2(tc);
 
-    /* Tile 3: Settings */
-    lv_obj_t* t3 = lv_tileview_add_tile(tileview, 3, 0, LV_DIR_LEFT);
-    create_screen4(t3);
+    lv_obj_t* te = lv_tileview_add_tile(tileview, SCREEN_ENGINE, 0, LV_DIR_LEFT);
+    create_screen3(te);
 
     /* Warning overlay — sibling of tileview, inside circle mask, on top of everything */
     warning_overlay_init(circle);
@@ -453,6 +455,10 @@ void screen_manager_create(void)
             lv_timer_create(tile_ready_timer_cb, 500, NULL);  /* 2 Hz poll */
         }
     }
+
+    /* Start on the golden/home screen (settings is the tile to its left). */
+    lv_tileview_set_tile_by_index(tileview, SCREEN_GOLDEN, 0, LV_ANIM_OFF);
+    current_screen = SCREEN_GOLDEN;
 }
 
 void screen_manager_set_demo(bool demo)
@@ -490,12 +496,12 @@ void screen_manager_update(const gauge_data_t* d)
     /* Warning overlay — always active regardless of screen */
     warning_overlay_update(d);
 
-    /* Screen 0: Golden gauge (comet + map + pods) — only when visible */
-    if (current_screen == 0)
+    /* Golden gauge (comet + map + pods) — only when visible */
+    if (current_screen == SCREEN_GOLDEN)
         golden_screen_update(d);
 
-    /* Screen 1: Full-size map + SOG/COG overlay */
-    if (current_screen == 1) {
+    /* Full-size map + SOG/COG overlay */
+    if (current_screen == SCREEN_CHART) {
         static uint32_t s2_map_frame = 0;
         if (++s2_map_frame >= 40) {
             s2_map_frame = 0;
@@ -511,8 +517,8 @@ void screen_manager_update(const gauge_data_t* d)
         }
     }
 
-    /* Screen 2: Engine detail labels */
-    if (current_screen == 2) {
+    /* Engine detail labels */
+    if (current_screen == SCREEN_ENGINE) {
         static uint32_t s3_frame = 0;
         if (++s3_frame < 2) goto s3_skip;  /* ~10Hz at 20Hz input */
         s3_frame = 0;
@@ -555,8 +561,8 @@ void screen_manager_prev(void)
 map_renderer_t* screen_manager_get_active_map(void)
 {
     switch (current_screen) {
-        case 0: return golden_screen_get_map();
-        case 1: return s2_map;
+        case SCREEN_GOLDEN: return golden_screen_get_map();
+        case SCREEN_CHART:  return s2_map;
         default: return NULL;
     }
 }
