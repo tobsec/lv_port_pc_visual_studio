@@ -37,8 +37,8 @@ static void sim_data_init(void)
     sim_data.fuel_rate_lph = 8.5f;
     sim_data.coolant_pressure_kpa = 55;
     sim_data.fuel_pressure_kpa = 380;
-    sim_data.lambda1 = 1.00f;
-    sim_data.lambda2 = 1.00f;
+    sim_data.lambda1 = 0.85f;
+    sim_data.lambda2 = 0.85f;
     sim_data.iat_c = 32;
     sim_data.latitude = 45.00;
     sim_data.longitude = 14.61;
@@ -88,8 +88,9 @@ static void sim_data_update(void)
     sim_data.battery_voltage = 13.8f + 0.5f * sinf(t * 0.4f);
 
     /* Lambda oscillates near stoich */
-    sim_data.lambda1 = 1.00f + 0.05f * sinf(t * 1.5f);
-    sim_data.lambda2 = 1.00f + 0.05f * sinf(t * 1.5f + 0.3f);
+    /* Same centre as the hardware demo (user runs rich, nominal 0.85). */
+    sim_data.lambda1 = 0.85f + 0.07f * sinf(t * 1.5f);
+    sim_data.lambda2 = 0.85f + 0.07f * sinf(t * 1.5f + 0.3f);
 
     /* IAT */
     sim_data.iat_c = 30 + 8 * sinf(t * 0.2f);
