@@ -69,6 +69,17 @@ void map_renderer_set_alt_tiles(map_renderer_t* mr, const char* alt_tile_base,
     lv_obj_t* btn_parent, int32_t x_ofs, int32_t y_ofs);
 
 /**
+ * Create a pair of zoom-in / zoom-out buttons at the given offsets on
+ * `btn_parent` (typically the tile container). Each button's position
+ * is independent so the pair can be stacked vertically OR laid out
+ * side-by-side, e.g. (-30, 200) / (30, 200) to sit between the
+ * theme and track buttons across the bottom of the map.
+ */
+void map_renderer_create_zoom_btns(map_renderer_t* mr, lv_obj_t* btn_parent,
+    int32_t x_in,  int32_t y_in,
+    int32_t x_out, int32_t y_out);
+
+/**
  * Attach a shared tile cache.  Enables async tile loading and LRU caching.
  * Call after create, before the first render.
  */
@@ -78,6 +89,13 @@ void map_renderer_set_cache(map_renderer_t* mr, tile_cache_t* cache);
  * Force a re-render (e.g. after background tile loads complete).
  */
 void map_renderer_render(map_renderer_t* mr);
+
+/**
+ * Pull the latest AIS targets from the global ais_store and redraw them on
+ * the chart overlay. Cheap — caller can invoke at the same cadence as
+ * map_renderer_set_position. Hidden slots reuse pool widgets.
+ */
+void map_renderer_refresh_ais(map_renderer_t* mr);
 
 /**
  * Get current view state.

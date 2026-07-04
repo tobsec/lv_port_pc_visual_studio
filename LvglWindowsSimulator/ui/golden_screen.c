@@ -1,5 +1,6 @@
 #include "golden_screen.h"
 #include "map_renderer.h"
+#include "icons/lv_image_telltale_icons.h"
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -68,10 +69,13 @@ static lv_obj_t* sog_unit_label;
 static lv_obj_t* depth_label;
 static lv_obj_t* nav_sep;
 static lv_obj_t* watertemp_label;
-/* Pod widgets: each pod has a status dot, value label, and bar */
+/* Pod widgets: icon on the left, value + unit centred to the right of it,
+ * thin range bar at the bottom. Icon recolour follows the alert state, so
+ * the telltale itself doubles as the alert indicator (in addition to the
+ * border + value-text color changes). */
 typedef struct {
     lv_obj_t* pod;    /* container */
-    lv_obj_t* dot;    /* status indicator (unused) */
+    lv_obj_t* icon;   /* DIN/ISO telltale (A8 image, recolored per alert) */
     lv_obj_t* val;    /* value label */
     lv_obj_t* unit;   /* unit label (smaller, dimmer) */
     lv_obj_t* bar;    /* thin range bar */
@@ -81,6 +85,116 @@ typedef struct {
 static gauge_pod_t pod_oilt, pod_oilp, pod_clt;
 static gauge_pod_t pod_lam, pod_cltp, pod_batt;
 
+/* ── Per-pod bar style ──────────────────────────────────────────────────
+ *
+ * Each pod's range bar carries: (1) a thin colored zone strip across the
+ * top showing where "normal" / "alert" / "danger" lie in the value range,
+ * (2) tick marks at semantically interesting values (centre = nominal for
+ * pods with hi/lo zones; 25 / 50 / 75 % for pods with only a single danger
+ * end), and (3) the lv_bar fill indicator at the bottom.
+ *
+ * Each pod_zone_t describes the LEFT edge of a colored band; the band ends
+ * where the next zone starts (or at bar_max for the last one). */
+typedef struct {
+    int32_t  value;
+    uint32_t color_hex;     /* RRGGBB; raw int so file-scope initialisers stay
+                             * constant — lv_color_hex() is a function call
+                             * and isn't a C constant expression. */
+} pod_zone_t;
+
+typedef struct {
+    const pod_zone_t* zones;
+    uint8_t           num_zones;
+    const int32_t*    ticks;
+    uint8_t           num_ticks;
+} pod_bar_style_t;
+
+/* Bar zone colors (separate from alert COL_RED/YELLOW so we can tune the
+ * strip on its own and so the bar-fill alert stays distinct from a
+ * "you're in the red zone" hint). */
+#define COL_ZONE_BLUE    0x2b7cffu
+#define COL_ZONE_NORMAL  0x3a4150u
+#define COL_ZONE_GREEN   0x00a040u
+#define COL_ZONE_YELLOW  0xa07000u
+#define COL_ZONE_RED     0xa01818u
+#define COL_TICK_HEX     0xe6edf3u
+
+/* ── Per-pod zone tables ── */
+/* Bar values are stored as scaled integers matching the existing
+ * lv_bar_set_value() calls in screen_manager.c — degrees C for temps, kPa
+ * for pressures, lambda × 100, volts × 10. Boundaries kept synchronised
+ * with the warning-overlay thresholds where applicable. */
+
+/* Oil temp 40-150 °C: cold blue<60, normal 60-110, red>110 (alert at 125). */
+static const pod_zone_t oil_temp_zones[] = {
+    {  40, COL_ZONE_BLUE   },
+    {  60, COL_ZONE_NORMAL },
+    { 110, COL_ZONE_RED    },
+};
+static const int32_t oil_temp_ticks[]      = { 85 };   /* nominal running temp */
+static const pod_bar_style_t style_oil_temp = {
+    oil_temp_zones, 3, oil_temp_ticks, 1
+};
+
+/* Coolant temp 40-100 °C: cold blue<65 (user-stated), normal 65-77, red>77. */
+static const pod_zone_t coolant_temp_zones[] = {
+    { 40, COL_ZONE_BLUE   },
+    { 65, COL_ZONE_NORMAL },
+    { 77, COL_ZONE_RED    },
+};
+static const int32_t coolant_temp_ticks[]    = { 71 };  /* user-stated nominal */
+static const pod_bar_style_t style_coolant_temp = {
+    coolant_temp_zones, 3, coolant_temp_ticks, 1
+};
+
+/* Lambda × 100 (range 70 = 0.70 .. 130 = 1.30): user-stated normal 0.80-0.95,
+ * nominal 0.85; outside that is rich / lean → red on both ends. */
+static const pod_zone_t lambda_zones[] = {
+    { 70, COL_ZONE_RED    },
+    { 80, COL_ZONE_NORMAL },
+    { 95, COL_ZONE_RED    },
+};
+static const int32_t lambda_ticks[]    = { 85 };
+static const pod_bar_style_t style_lambda = {
+    lambda_zones, 3, lambda_ticks, 1
+};
+
+/* Battery × 10 (range 110 = 11.0 V .. 150 = 15.0 V):
+ *   red <12.0 (alert threshold), yellow 12.0-13.5 (discharged),
+ *   green 13.5-14.0 (user-stated normal charging), neutral above. */
+static const pod_zone_t battery_zones[] = {
+    { 110, COL_ZONE_RED    },
+    { 120, COL_ZONE_YELLOW },
+    { 135, COL_ZONE_GREEN  },
+    { 140, COL_ZONE_NORMAL },
+};
+static const int32_t battery_ticks[]      = { 138 };   /* 13.8 V mid-charge */
+static const pod_bar_style_t style_battery = {
+    battery_zones, 4, battery_ticks, 1
+};
+
+/* Oil pressure 0-600 kPa: red <150 (alert threshold), normal above.
+ * No "high" danger zone — ticks at 25/50/75 % give scale context. */
+static const pod_zone_t oil_press_zones[] = {
+    {   0, COL_ZONE_RED    },
+    { 150, COL_ZONE_NORMAL },
+};
+static const int32_t oil_press_ticks[]    = { 150, 300, 450 };
+static const pod_bar_style_t style_oil_press = {
+    oil_press_zones, 2, oil_press_ticks, 3
+};
+
+/* Coolant pressure 0-100 kPa: red <15 (alert threshold), normal above.
+ * Ticks at 25/50/75 %. */
+static const pod_zone_t coolant_press_zones[] = {
+    {  0, COL_ZONE_RED    },
+    { 15, COL_ZONE_NORMAL },
+};
+static const int32_t coolant_press_ticks[]    = { 25, 50, 75 };
+static const pod_bar_style_t style_coolant_press = {
+    coolant_press_zones, 2, coolant_press_ticks, 3
+};
+
 /* Bottom readouts (remaining params without pods) */
 static lv_obj_t* lbl_lambda1;
 static lv_obj_t* lbl_lambda2;
@@ -88,6 +202,15 @@ static lv_obj_t* lbl_iat;
 static lv_obj_t* lbl_map;
 static lv_obj_t* lbl_fp;
 static lv_obj_t* lbl_fuel;
+
+/* CAN-bus health indicators — small DIN telltales at the very bottom of
+ * the golden screen, flanking the readout row. Engine (mdi-engine) for
+ * the ECU CAN, broadcast (mdi-broadcast) for the nav CAN. Recolour green
+ * when traffic is flowing, dim grey when the bus is stale. */
+static lv_obj_t* can_icon_engine = NULL;
+static lv_obj_t* can_icon_nav    = NULL;
+static int8_t    can_engine_state = -1;
+static int8_t    can_nav_state    = -1;
 
 /* ── Helpers ── */
 
@@ -460,9 +583,41 @@ static void comet_redraw(float rpm)
  *  │  ▓▓▓▓▓▓▓▓░░░░░  │  ← thin bar
  *  └──────────────────┘
  */
+/* Tiny helper: a borderless, padding-less, click-through rectangle of solid
+ * color — used for both the bar's zone bands and its tick marks. */
+static lv_obj_t* make_pod_rect(lv_obj_t* parent, int32_t x, int32_t y,
+                               int32_t w, int32_t h, lv_color_t color)
+{
+    lv_obj_t* r = lv_obj_create(parent);
+    lv_obj_set_pos(r, x, y);
+    lv_obj_set_size(r, w, h);
+    lv_obj_set_style_pad_all(r, 0, 0);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_radius(r, 0, 0);
+    lv_obj_set_style_bg_color(r, color, 0);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(r, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    return r;
+}
+
+/* Pod layout:
+ *   ┌──────────────────────────────┐
+ *   │  ◔   92  °C                  │   icon-left, oversized value, small unit
+ *   │                              │
+ *   │  ░░░░░░│░░░░░░░░░░│░░░░░░░░  │   zone strip (colored bands) + ticks
+ *   │  ▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░  │   value-fill bar below the zones
+ *   └──────────────────────────────┘
+ * Icon size fixed at 32 px (the _32 variant of tt_icon_<name>); value font
+ * and bar style passed by caller. The "bar" is now a small container
+ * holding a colored zone strip on top, the fill indicator below, and tick
+ * marks overlaid on both. */
 static void create_pod(lv_obj_t* parent, int32_t x, int32_t y, int32_t w, int32_t h,
-    const char* label_text, const char* init_val, const char* unit_text,
+    const lv_image_dsc_t* icon_src,
+    const char* init_val, const char* unit_text,
+    const lv_font_t* val_font,
     int32_t bar_min, int32_t bar_max, int32_t bar_init,
+    const pod_bar_style_t* bar_style,
     gauge_pod_t* out)
 {
     /* Container */
@@ -479,44 +634,108 @@ static void create_pod(lv_obj_t* parent, int32_t x, int32_t y, int32_t w, int32_
     lv_obj_remove_flag(pod, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(pod, LV_OBJ_FLAG_SCROLLABLE);
     out->pod = pod;
-    out->dot = NULL;
 
-    /* Large value — centered */
+    /* Telltale icon — A8 32×32, recoloured per alert. Centre vertically in
+     * the upper portion of the pod (above the bottom bar). */
+    lv_obj_t* icon = lv_image_create(pod);
+    lv_image_set_src(icon, icon_src);
+    lv_obj_set_style_image_recolor(icon, COL_TEXT_DIM, 0);
+    lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
+    /* Offset Y by -7 to compensate for the bottom bar so the icon centres
+     * in the pod's "value area" instead of the geometric centre. */
+    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 8, -7);
+    out->icon = icon;
+
+    /* Large value — anchored to the right of the icon, vertically aligned
+     * to the icon's centre so they read on the same baseline. */
     lv_obj_t* val = lv_label_create(pod);
     lv_label_set_text(val, init_val);
     lv_obj_set_style_text_color(val, COL_TEXT, 0);
-    lv_obj_set_style_text_font(val, &lv_font_montserrat_24, 0);
-    lv_obj_align(val, LV_ALIGN_TOP_MID, -8, 6);
+    lv_obj_set_style_text_font(val, val_font, 0);
+    lv_obj_align(val, LV_ALIGN_LEFT_MID, 48, -7);
     out->val = val;
 
-    /* Unit — smaller, dimmer, positioned after the value */
+    /* Unit — smaller, dimmer, hanging off the value's right at its bottom.
+     * The y offset compensates for the height difference between the value
+     * font and the unit font so the unit's bottom sits flush with the value's
+     * bottom — without this, OUT_RIGHT_BOTTOM with offset -2 looks fine for
+     * a 24px value but the unit hangs noticeably low when the value font
+     * grows to 32 or 40. Formula tuned against monserrat_24 as the baseline
+     * where -2 was already correct. */
     lv_obj_t* unt = lv_label_create(pod);
     lv_label_set_text(unt, unit_text);
-    lv_obj_set_style_text_color(unt, lv_color_hex(0x6e7681), 0);
+    lv_obj_set_style_text_color(unt, COL_TEXT_DIM, 0);
     lv_obj_set_style_text_font(unt, &lv_font_montserrat_14, 0);
-    lv_obj_align_to(unt, val, LV_ALIGN_OUT_RIGHT_BOTTOM, 3, -2);
+    /* For unit BOTTOM to land on the value's visual baseline, shift the unit
+     * up by the full font-line-height delta. The /2 we had before only got
+     * us halfway; the result still hung visibly below the digit bottoms.
+     * monserrat_24 (line_height 30) was the baseline where the original
+     * -2 worked — for any larger value font, push up by the difference. */
+    int32_t base_lh = (int32_t)lv_font_montserrat_24.line_height;
+    int32_t unit_y  = -2 - ((int32_t)val_font->line_height - base_lh);
+    lv_obj_align_to(unt, val, LV_ALIGN_OUT_RIGHT_BOTTOM, 3, unit_y);
     out->unit = unt;
 
-    /* Small label below value — dimmer, smaller */
-    lv_obj_t* lbl = lv_label_create(pod);
-    lv_label_set_text(lbl, label_text);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0x6e7681), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 34);
+    /* Range bar — a thin container with three layers:
+     *   - zone strip across the top (colored bands per pod_bar_style_t)
+     *   - lv_bar fill indicator across the bottom (existing behaviour)
+     *   - tick marks overlaid on top of both, at the values in bar_style->ticks
+     * Anchored to the pod's bottom edge so it grows upward as bar_box_h
+     * changes. The lv_bar inside is still what receives lv_bar_set_value() in
+     * screen_manager.c, so the value-tracking path is unchanged. */
+    const int32_t bar_box_w = w - 20;
+    const int32_t bar_box_h = 12;          /* 3 zone + 8 fill + 1 gap, room for tick */
+    const int32_t zone_h    = 3;
+    const int32_t fill_h    = 8;
+    lv_obj_t* bar_box = make_pod_rect(pod, 0, 0, bar_box_w, bar_box_h, COL_ARC_TRACK);
+    lv_obj_align(bar_box, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_radius(bar_box, 2, 0);
 
-    /* Thin bar at bottom */
-    lv_obj_t* bar = lv_bar_create(pod);
-    lv_obj_set_size(bar, w - 20, 4);
-    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -6);
+    /* Zone bands across the top strip. Map each zone's [value_start .. value_end)
+     * to a pixel range and paint a solid rect. The last zone runs to bar_max. */
+    if (bar_style && bar_style->num_zones > 0) {
+        for (uint8_t i = 0; i < bar_style->num_zones; i++) {
+            int32_t z_start = bar_style->zones[i].value;
+            int32_t z_end   = (i + 1 < bar_style->num_zones)
+                              ? bar_style->zones[i + 1].value
+                              : bar_max;
+            if (z_end <= z_start) continue;
+            int32_t px_start = (z_start - bar_min) * bar_box_w / (bar_max - bar_min);
+            int32_t px_end   = (z_end   - bar_min) * bar_box_w / (bar_max - bar_min);
+            if (px_start < 0) px_start = 0;
+            if (px_end > bar_box_w) px_end = bar_box_w;
+            if (px_end <= px_start) continue;
+            make_pod_rect(bar_box, px_start, 0, px_end - px_start, zone_h,
+                          lv_color_hex(bar_style->zones[i].color_hex));
+        }
+    }
+
+    /* Fill bar — anchored to the bottom of bar_box so the zone strip stays
+     * visible above it. Its indicator colour follows the alert state via
+     * pod_set_alert / pod_set_normal, exactly as before. */
+    lv_obj_t* bar = lv_bar_create(bar_box);
+    lv_obj_set_size(bar, bar_box_w, fill_h);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_bar_set_range(bar, bar_min, bar_max);
     lv_bar_set_value(bar, bar_init, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(bar, COL_ARC_TRACK, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 1, LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, COL_NORMAL, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 1, LV_PART_INDICATOR);
     out->bar = bar;
+
+    /* Tick marks — drawn last so they sit on top of both zones and fill.
+     * 2 px wide vertical lines spanning the full bar_box height. */
+    if (bar_style && bar_style->num_ticks > 0) {
+        for (uint8_t i = 0; i < bar_style->num_ticks; i++) {
+            int32_t tv = bar_style->ticks[i];
+            int32_t px = (tv - bar_min) * bar_box_w / (bar_max - bar_min);
+            if (px < 0 || px >= bar_box_w) continue;
+            make_pod_rect(bar_box, px - 1, 0, 2, bar_box_h, lv_color_hex(COL_TICK_HEX));
+        }
+    }
 }
 
 /* Update pod alert state: changes border, value text, bar, and dot color.
@@ -528,6 +747,7 @@ static void pod_set_alert(gauge_pod_t* p, lv_color_t color)
     p->alert = lvl;
     lv_obj_set_style_border_color(p->pod, color, 0);
     lv_obj_set_style_text_color(p->val, color, 0);
+    lv_obj_set_style_image_recolor(p->icon, color, 0);   /* telltale tints with alert */
     lv_obj_set_style_bg_color(p->bar, color, LV_PART_INDICATOR);
 }
 
@@ -546,7 +766,22 @@ static void pod_set_normal(gauge_pod_t* p)
     p->alert = 1;
     lv_obj_set_style_border_color(p->pod, COL_POD_BORDER, 0);
     lv_obj_set_style_text_color(p->val, COL_TEXT, 0);
+    lv_obj_set_style_image_recolor(p->icon, COL_TEXT_DIM, 0);
     lv_obj_set_style_bg_color(p->bar, COL_NORMAL, LV_PART_INDICATOR);
+}
+
+/* "Cold" state for the two temperature pods: not an alert (icon / border /
+ * value text stay normal), but the fill bar shows blue so a glance tells
+ * you the engine is below operating temp. Use a separate alert level (4)
+ * so the cached-state check in pod_set_normal / pod_set_alert still works. */
+static void pod_set_cold(gauge_pod_t* p)
+{
+    if (p->alert == 4) return;
+    p->alert = 4;
+    lv_obj_set_style_border_color(p->pod, COL_POD_BORDER, 0);
+    lv_obj_set_style_text_color(p->val, COL_TEXT, 0);
+    lv_obj_set_style_image_recolor(p->icon, COL_TEXT_DIM, 0);
+    lv_obj_set_style_bg_color(p->bar, lv_color_hex(COL_ZONE_BLUE), LV_PART_INDICATOR);
 }
 
 /* Create a tiny label for the bottom readout row */
@@ -667,10 +902,24 @@ void golden_screen_create(lv_obj_t* parent)
             /* Vignette disabled — pixel-by-pixel alpha blend is too expensive on ESP32 */
             /* map_renderer_set_vignette(gs_map, 0.65f, COL_BG); */
             map_renderer_create_track_btn(gs_map, root, 220, 60);
+            map_renderer_create_zoom_btns(gs_map, root, -30, 60, 30, 60);
             if (alt_tile_path) {
                 map_renderer_set_alt_tiles(gs_map, alt_tile_path, root, -220, 60);
             }
         }
+    } else {
+        /* No SD / no map data — replace the empty chart area with a clear
+         * "card missing" overlay. Smaller layout to fit the 600-px area. */
+        lv_obj_t* icon = lv_image_create(chart_area);
+        lv_image_set_src(icon, &tt_icon_sd_missing_32);
+        lv_obj_set_style_image_recolor(icon, COL_TEXT_DIM, 0);
+        lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
+        lv_obj_align(icon, LV_ALIGN_CENTER, 0, -18);
+
+        lv_obj_t* lbl = lv_label_create(chart_area);
+        lv_label_set_text(lbl, "No map");
+        lv_obj_set_style_text_color(lbl, COL_TEXT_DIM, 0);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 18);
     }
 
     /* ════════════════════════════════════════════
@@ -841,12 +1090,19 @@ void golden_screen_create(lv_obj_t* parent)
     int32_t row1_x = (DISP_SIZE - row1_total) / 2;
     int32_t row1_y = 545;
 
+    /* Bar ranges tuned so the "normal" tick lands near the centre:
+     *   oil_temp 40-130 (nominal 85 at 56 % — close to centre)
+     *   coolant_temp 40-100 (nominal 71 at 52 %)
+     *   lambda 70-110 (nominal 85 at 38 %; user runs rich) */
     create_pod(root, row1_x,                      row1_y, pod_w1, pod_h1,
-        "OIL",   "92", "°C",  40, 150, 92,  &pod_oilt);
+        &tt_icon_oil_temp_32,     "92",  "°C",  &lv_font_montserrat_40,
+        40, 130, 92,  &style_oil_temp,     &pod_oilt);
     create_pod(root, row1_x + pod_w1 + pod_gap,   row1_y, pod_w1, pod_h1,
-        "PRESS", "4.2", "bar", 0, 600, 420, &pod_oilp);
+        &tt_icon_oil_press_32,    "4.2", "bar", &lv_font_montserrat_40,
+        0,  600, 420, &style_oil_press,    &pod_oilp);
     create_pod(root, row1_x + (pod_w1 + pod_gap)*2, row1_y, pod_w1, pod_h1,
-        "CLT",   "72", "°C",  40, 110, 77,  &pod_clt);
+        &tt_icon_coolant_temp_32, "72",  "°C",  &lv_font_montserrat_40,
+        40, 100, 77,  &style_coolant_temp, &pod_clt);
 
     /* ════════════════════════════════════════════
      *  Gauge pods — Row 2: 3 pods (Lambda, CltP, Batt)
@@ -858,11 +1114,14 @@ void golden_screen_create(lv_obj_t* parent)
     int32_t row2_y = row1_y + pod_h1 + pod_gap;
 
     create_pod(root, row2_x,                      row2_y, pod_w2, pod_h2,
-        "LAM",  "1.00", "",    70, 130, 100, &pod_lam);
+        &tt_icon_lambda_32,        "1.00", "",    &lv_font_montserrat_32,
+        70,  110, 100, &style_lambda,        &pod_lam);
     create_pod(root, row2_x + pod_w2 + pod_gap,   row2_y, pod_w2, pod_h2,
-        "CP",   "55", "kPa",  0,  100, 55,  &pod_cltp);
+        &tt_icon_coolant_press_32, "55",   "kPa", &lv_font_montserrat_32,
+        0,   100, 55,  &style_coolant_press, &pod_cltp);
     create_pod(root, row2_x + (pod_w2 + pod_gap)*2, row2_y, pod_w2, pod_h2,
-        "BAT",  "14.1", "V",  110, 150, 141, &pod_batt);
+        &tt_icon_battery_32,       "14.1", "V",   &lv_font_montserrat_32,
+        110, 150, 141, &style_battery,       &pod_batt);
 
     /* ════════════════════════════════════════════
      *  Bottom digital readouts
@@ -883,6 +1142,29 @@ void golden_screen_create(lv_obj_t* parent)
     int32_t rdout2_start = (DISP_SIZE - rdout2_w * 2) / 2;
     lbl_fp      = create_readout(root, rdout2_start,          rdout2_y, "FP ---");
     lbl_fuel    = create_readout(root, rdout2_start + rdout2_w, rdout2_y, "FC ---");
+
+    /* ════════════════════════════════════════════
+     *  CAN-bus health indicators (24 px telltales) — placed just
+     *  below the row 2 pods (which end at y≈695). The right x is
+     *  pinned at 610 to clear the worst-case MAP readout overflow
+     *  ("MAP 100 kPa" extends to ~x=605); left x mirrors it about
+     *  the display centre (400 - (610+12-400) - 12 = 166) so the
+     *  two icons sit symmetrically. */
+    const int32_t can_icon_y = 700;
+    can_icon_engine = lv_image_create(root);
+    lv_image_set_src(can_icon_engine, &tt_icon_engine_24);
+    lv_obj_set_pos(can_icon_engine, 166, can_icon_y);
+    lv_obj_set_style_image_recolor(can_icon_engine, COL_TEXT_DIM, 0);
+    lv_obj_set_style_image_recolor_opa(can_icon_engine, LV_OPA_COVER, 0);
+
+    can_icon_nav = lv_image_create(root);
+    lv_image_set_src(can_icon_nav, &tt_icon_can_network_24);
+    lv_obj_set_pos(can_icon_nav, 610, can_icon_y);
+    lv_obj_set_style_image_recolor(can_icon_nav, COL_TEXT_DIM, 0);
+    lv_obj_set_style_image_recolor_opa(can_icon_nav, LV_OPA_COVER, 0);
+
+    can_engine_state = -1;     /* force first golden_screen_update() to paint */
+    can_nav_state    = -1;
 }
 
 /* ════════════════════════════════════════════
@@ -891,6 +1173,21 @@ void golden_screen_create(lv_obj_t* parent)
 void golden_screen_update(const gauge_data_t* d)
 {
     char buf[32];
+
+    /* CAN-bus health indicators — only repaint when the binary state changes,
+     * so the tiny recolor cost doesn't add to every refresh. */
+    int8_t engine_state = d->engine_can_active ? 1 : 0;
+    if (engine_state != can_engine_state && can_icon_engine) {
+        can_engine_state = engine_state;
+        lv_obj_set_style_image_recolor(can_icon_engine,
+            engine_state ? COL_GREEN : COL_TEXT_DIM, 0);
+    }
+    int8_t nav_state = d->nav_can_active ? 1 : 0;
+    if (nav_state != can_nav_state && can_icon_nav) {
+        can_nav_state = nav_state;
+        lv_obj_set_style_image_recolor(can_icon_nav,
+            nav_state ? COL_GREEN : COL_TEXT_DIM, 0);
+    }
 
 #ifdef COMET_DISABLE
     /* Ring-band needle (relative coords keep invalidation tight; data is fed by
@@ -955,6 +1252,7 @@ void golden_screen_update(const gauge_data_t* d)
         if (gs_map && d->latitude != 0.0 && d->longitude != 0.0) {
             map_renderer_set_position(gs_map, d->latitude, d->longitude, d->cog_degrees);
         }
+        if (gs_map) map_renderer_refresh_ais(gs_map);
     }
 
     /* Stagger slow-changing value updates across frames to avoid invalidation spikes.
@@ -976,8 +1274,9 @@ void golden_screen_update(const gauge_data_t* d)
             lv_bar_set_value(pod_oilt.bar, (int32_t)d->oil_temp_c, LV_ANIM_OFF);
             snprintf(buf, sizeof(buf), "%.0f", d->oil_temp_c);
             pod_update_val(&pod_oilt, buf);
-            if (d->oil_temp_c > 125)      pod_set_alert(&pod_oilt, COL_RED);
+            if      (d->oil_temp_c > 125)  pod_set_alert(&pod_oilt, COL_RED);
             else if (d->oil_temp_c > 110)  pod_set_alert(&pod_oilt, COL_YELLOW);
+            else if (d->oil_temp_c < 60)   pod_set_cold(&pod_oilt);
             else                           pod_set_normal(&pod_oilt);
 
             lv_bar_set_value(pod_oilp.bar, (int32_t)d->oil_pressure_kpa, LV_ANIM_OFF);
@@ -996,8 +1295,9 @@ void golden_screen_update(const gauge_data_t* d)
             lv_bar_set_value(pod_clt.bar, (int32_t)d->coolant_temp_c, LV_ANIM_OFF);
             snprintf(buf, sizeof(buf), "%.0f", d->coolant_temp_c);
             pod_update_val(&pod_clt, buf);
-            if (d->coolant_temp_c > 77)       pod_set_alert(&pod_clt, COL_RED);
+            if      (d->coolant_temp_c > 77)  pod_set_alert(&pod_clt, COL_RED);
             else if (d->coolant_temp_c > 70)  pod_set_alert(&pod_clt, COL_YELLOW);
+            else if (d->coolant_temp_c < 65)  pod_set_cold(&pod_clt);
             else                              pod_set_normal(&pod_clt);
         } else {
             pod_show_dash(&pod_clt, "---");
@@ -1008,9 +1308,11 @@ void golden_screen_update(const gauge_data_t* d)
             lv_bar_set_value(pod_lam.bar, (int32_t)(worst_lambda * 100), LV_ANIM_OFF);
             snprintf(buf, sizeof(buf), "%.2f", worst_lambda);
             pod_update_val(&pod_lam, buf);
-            if (worst_lambda < 0.85f || worst_lambda > 1.15f)       pod_set_alert(&pod_lam, COL_RED);
-            else if (worst_lambda < 0.90f || worst_lambda > 1.10f)  pod_set_alert(&pod_lam, COL_YELLOW);
-            else                                                    pod_set_normal(&pod_lam);
+            /* Thresholds match the pod's red zones (user runs rich, normal
+             * 0.80-0.95). No intermediate yellow band — fill goes red as
+             * soon as the value enters either red zone, matching the strip. */
+            if (worst_lambda < 0.80f || worst_lambda > 0.95f) pod_set_alert(&pod_lam, COL_RED);
+            else                                              pod_set_normal(&pod_lam);
         } else {
             pod_show_dash(&pod_lam, "-.--");
         }

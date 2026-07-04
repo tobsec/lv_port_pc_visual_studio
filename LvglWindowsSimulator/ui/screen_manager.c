@@ -3,6 +3,10 @@
 #include "map_renderer.h"
 #include "tile_cache.h"
 #include "warning_overlay.h"
+#ifdef ESP_PLATFORM
+  #include "last_position.h"
+#endif
+#include "icons/lv_image_telltale_icons.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -110,10 +114,25 @@ static void create_screen2(lv_obj_t* tile)
         if (s2_map) {
             /* View set later (after the cache exists) so tiles load async. */
             map_renderer_create_track_btn(s2_map, tile, 250, 200);
+            map_renderer_create_zoom_btns(s2_map, tile, -30, 200, 30, 200);
             if (alt_tile_path) {
                 map_renderer_set_alt_tiles(s2_map, alt_tile_path, tile, -250, 200);
             }
         }
+    } else {
+        /* No SD / no map data — replace the empty chart area with a clear
+         * "card missing" overlay so the screen isn't just a black hole. */
+        lv_obj_t* icon = lv_image_create(chart_area);
+        lv_image_set_src(icon, &tt_icon_sd_missing);
+        lv_obj_set_style_image_recolor(icon, COL_TEXT_DIM, 0);
+        lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
+        lv_obj_align(icon, LV_ALIGN_CENTER, 0, -30);
+
+        lv_obj_t* lbl = lv_label_create(chart_area);
+        lv_label_set_text(lbl, "No map data\nSD card not available");
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(lbl, COL_TEXT_DIM, 0);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 40);
     }
 
     /* SOG/COG overlay bar at bottom */
@@ -343,7 +362,15 @@ static void create_screen4(lv_obj_t* tile)
     for (int i = 0; i < THR_COUNT; i++) create_thr_row(col, i);
 }
 
-/* Tileview scroll events — freeze updates during swipe transitions */
+/* Tileview scroll events — freeze updates during swipe transitions.
+ *
+ * NB: an earlier attempt to snapshot tiles via lv_snapshot_take at
+ * SCROLL_BEGIN and swap them in for the live widgets did not help —
+ * diagnostics showed snapshot_take of the golden tile alone takes ~365 ms
+ * (full uncached render through a different LVGL code path than incremental
+ * redraw), longer than the swipe animation itself. By the time the
+ * snapshots were ready the swipe was already over. Per-tile rendering cost
+ * is the bottleneck, not the buffer pipeline. */
 static void tileview_scroll_begin_cb(lv_event_t* e)
 {
     (void)e;
@@ -394,12 +421,18 @@ void screen_manager_create(void)
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    /* Circular mask — clips everything to round display */
+    /* "Circular" container — the physical panel is round, so anything in the
+     * 800×800 framebuffer outside the inscribed circle is invisible. On the
+     * hardware target we skip the per-pixel clip_corner mask entirely: that
+     * mask runs over every rendered pixel, and on a round display it's pure
+     * wasted bandwidth. The sim still gets the visual circle for dev. */
     lv_obj_t* circle = lv_obj_create(scr);
     lv_obj_set_size(circle, DISP_SIZE, DISP_SIZE);
     lv_obj_center(circle);
+#ifndef ESP_PLATFORM
     lv_obj_set_style_radius(circle, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_clip_corner(circle, true, 0);
+#endif
     lv_obj_set_style_bg_color(circle, COL_BG, 0);
     lv_obj_set_style_bg_opa(circle, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(circle, 0, 0);
@@ -456,16 +489,31 @@ void screen_manager_create(void)
     if (tile_path) {
         g_tile_cache = tile_cache_create(64);  /* 64 tiles × 128 KB = 8 MB */
         if (g_tile_cache) {
+            /* Restore the last persisted position (NVS) so we open near
+             * where the boat was last powered down. Falls back to the
+             * Krk fairway default if NVS is empty (first boot).
+             * Sim build skips the NVS lookup — no persistence target. */
+            double init_lat = 45.00, init_lon = 14.61;
+            int32_t init_zoom = 13;
+#ifdef ESP_PLATFORM
+            last_position_t lp;
+            if (last_position_load(&lp)) {
+                init_lat  = lp.lat;
+                init_lon  = lp.lon;
+                init_zoom = lp.zoom;
+            }
+#endif
+
             map_renderer_t* gs_map = golden_screen_get_map();
             /* Attach cache, then set the view — tiles are requested via the
              * background loader (async), so the UI appears before they arrive. */
             if (gs_map) {
                 map_renderer_set_cache(gs_map, g_tile_cache);
-                map_renderer_set_view(gs_map, 45.00, 14.61, 13);
+                map_renderer_set_view(gs_map, init_lat, init_lon, init_zoom);
             }
             if (s2_map) {
                 map_renderer_set_cache(s2_map, g_tile_cache);
-                map_renderer_set_view(s2_map, 45.00, 14.61, 13);
+                map_renderer_set_view(s2_map, init_lat, init_lon, init_zoom);
             }
             tile_cache_start_loader(g_tile_cache);
             lv_timer_create(tile_ready_timer_cb, 500, NULL);  /* 2 Hz poll */
@@ -516,16 +564,28 @@ void screen_manager_update(const gauge_data_t* d)
     /* Skip all value/widget updates when nothing relevant changed, so a static
      * screen (e.g. no CAN data, all "---") does no rendering and idles the CPU.
      * Ignore the churning last_update_ms timestamp; force a refresh when the
-     * active screen changes (a swipe lands on a new tile). */
+     * active screen changes (a swipe lands on a new tile).
+     *
+     * Catch: golden_screen_update staggers slow widgets across a 5-phase
+     * `slow_slot % 5` cycle (nav / oil / clt+lam / cltp+batt / bottom rdouts).
+     * If we early-return as soon as data goes static, only the phase that
+     * happened to be running at that instant lands; the rest stay frozen at
+     * their previous values. So whenever data changes, schedule a 5-frame
+     * refresh window — enough to cover every phase once — before the guard
+     * can kick back in. */
     static gauge_data_t prev;
     static bool have_prev = false;
     static int32_t last_render_screen = -1;
+    static uint8_t  force_refresh = 0;
     gauge_data_t cur = *d;
     cur.last_update_ms = 0;
-    if (have_prev && current_screen == last_render_screen &&
-        memcmp(&cur, &prev, sizeof(cur)) == 0) {
+    bool changed = !have_prev || current_screen != last_render_screen ||
+                   memcmp(&cur, &prev, sizeof(cur)) != 0;
+    if (changed) force_refresh = 5;
+    if (!changed && force_refresh == 0) {
         return;
     }
+    if (force_refresh > 0) force_refresh--;
     prev = cur;
     have_prev = true;
     last_render_screen = current_screen;
@@ -541,7 +601,13 @@ void screen_manager_update(const gauge_data_t* d)
             s2_map_frame = 0;
             if (s2_map && d->latitude != 0.0 && d->longitude != 0.0) {
                 map_renderer_set_position(s2_map, d->latitude, d->longitude, d->cog_degrees);
+#ifdef ESP_PLATFORM
+                last_position_maybe_save(d->latitude, d->longitude,
+                                         d->cog_degrees,
+                                         map_renderer_get_zoom(s2_map));
+#endif
             }
+            if (s2_map) map_renderer_refresh_ais(s2_map);
         }
         static uint32_t s2_label_frame = 0;
         if (++s2_label_frame >= 5) {
