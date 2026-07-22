@@ -8,6 +8,7 @@
 #include "ui/gauge_data.h"
 #include "ui/map_renderer.h"
 #include "ui/golden_screen.h"
+#include "fusion_state.h"
 
 /*
  * Marine Gauge Simulator — Golden Screen
@@ -122,6 +123,11 @@ static void sim_timer_cb(lv_timer_t* timer)
 {
     (void)timer;
     sim_data_update();
+    /* Drive the same fake-Fusion publisher demo mode uses on hardware.
+     * On the ESP target this fires from main.c's demo_data_task; here we
+     * piggyback on the sim's 20 Hz gauge tick so the media tile sees the
+     * same rev-bumped state stream. */
+    fusion_state_publish_demo((uint32_t)lv_tick_get());
     screen_manager_update(&sim_data);
 
     /* Poll +/- keys for map zoom (edge-triggered) */
@@ -222,6 +228,7 @@ int main()
 
     /* Initialize simulated data and create all screens */
     sim_data_init();
+    fusion_state_init();
     screen_manager_set_tile_path("C:/Data/marine-gauge/tools/MAP_BIN");
     screen_manager_set_alt_tile_path("C:/Data/marine-gauge/tools/MAP_DARK");
     screen_hooks_t hooks = { sim_set_brightness, sim_set_demo, sim_set_threshold };

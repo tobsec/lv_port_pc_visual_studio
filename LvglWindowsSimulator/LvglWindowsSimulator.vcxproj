@@ -27,7 +27,7 @@
   <Import Project="..\LvglPlatform\LvglWindowsIconResource\LvglWindowsIconResource.props" />
   <Import Project="freetype.props" />
   <PropertyGroup>
-    <IncludePath>$(MSBuildThisFileDirectory);$(MSBuildThisFileDirectory)ui\;$(MSBuildThisFileDirectory)..\LvglPlatform\lvgl\;$(MSBuildThisFileDirectory)..\LvglPlatform\;$(IncludePath)</IncludePath>
+    <IncludePath>$(MSBuildThisFileDirectory);$(MSBuildThisFileDirectory)ui\;$(MSBuildThisFileDirectory)..\..\firmware\components\fusion\include\;$(MSBuildThisFileDirectory)..\..\firmware\components\fusion\;$(MSBuildThisFileDirectory)..\..\firmware\components\ais_store\;$(MSBuildThisFileDirectory)..\LvglPlatform\lvgl\;$(MSBuildThisFileDirectory)..\LvglPlatform\;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -4198,6 +4198,18 @@
       <LanguageStandard>Default</LanguageStandard>
     </ClCompile>
     <ClCompile Include="ui\warning_overlay.c">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <LanguageStandard>Default</LanguageStandard>
+    </ClCompile>
+    <ClCompile Include="ui\media_screen.c">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <LanguageStandard>Default</LanguageStandard>
+    </ClCompile>
+    <ClCompile Include="ui\fusion_tx_stub.c">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <LanguageStandard>Default</LanguageStandard>
+    </ClCompile>
+    <ClCompile Include="..\..\firmware\components\fusion\fusion_state.c">
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>Default</LanguageStandard>
     </ClCompile>

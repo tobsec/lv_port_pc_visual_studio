@@ -5,10 +5,12 @@ idf_component_register(
         "map_renderer.c"
         "tile_cache.c"
         "warning_overlay.c"
+        "ais_screen.c"
+        "media_screen.c"
         "icons/lv_image_telltale_icons.c"
     INCLUDE_DIRS "."
     REQUIRES lvgl__lvgl esp_lcd
-    PRIV_REQUIRES settings ais_store
+    PRIV_REQUIRES settings ais_store fusion
 )
 
 # Allow #include "lvgl/lvgl.h" via build-tree forwarding header

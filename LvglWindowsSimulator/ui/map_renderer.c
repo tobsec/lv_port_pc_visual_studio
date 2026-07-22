@@ -1,13 +1,72 @@
 #include "map_renderer.h"
 #include "tile_cache.h"
 #include "icons/lv_image_telltale_icons.h"
+#include "ais_store.h"   /* pure header — safe on sim (types + enums only) */
 #ifdef ESP_PLATFORM
-  #include "ais_store.h"
+  #include "esp_heap_caps.h"
+  #include "esp_timer.h"
 #endif
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* Single shared scratch for AIS store snapshots. Used by refresh_ais,
+ * reposition_ais_only, focus_mmsi and the click callbacks. All of
+ * these only ever run on the LVGL task, so a shared static is safe
+ * and stays out of the LVGL task stack (128-vessel array is ~15 KB —
+ * too much stack per nested call). Kept in PSRAM: as BSS the
+ * 15 KB + 3 KB pair ate enough internal DRAM that the LVGL task's
+ * 32 KB stack couldn't be allocated at boot (rc=-1, splash stayed
+ * frozen). Lazy-init on first use because map_renderer_create can be
+ * called from either map's construction. */
+#ifdef ESP_PLATFORM
+static ais_vessel_t *s_ais_v_scratch = NULL;
+static ais_aton_t   *s_ais_a_scratch = NULL;
+static bool ensure_ais_scratch(void)
+{
+    if (s_ais_v_scratch && s_ais_a_scratch) return true;
+    if (!s_ais_v_scratch) {
+        s_ais_v_scratch = (ais_vessel_t *)heap_caps_malloc(
+            sizeof(ais_vessel_t) * AIS_MAX_VESSELS,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_ais_a_scratch) {
+        s_ais_a_scratch = (ais_aton_t *)heap_caps_malloc(
+            sizeof(ais_aton_t) * AIS_MAX_ATONS,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    return s_ais_v_scratch && s_ais_a_scratch;
+}
+#endif
+
+/* Compile-time diagnostic for the AIS blink investigation. When ON,
+ * refresh_ais logs slot transitions (new MMSI at slot X, slot Y hidden,
+ * slot Z opacity flip) so we can see what's actually churning between
+ * refreshes. Rate-limited to keep the serial log survivable — one
+ * summary line per refresh + one detail line per transition. Turn OFF
+ * once we've caught the pattern. */
+#define AIS_BLINK_DEBUG 0
+#if AIS_BLINK_DEBUG
+  #include "esp_log.h"
+  #define AIS_DBG_TAG "ais_dbg"
+#endif
+
+/* Pixel buffers on target should live in PSRAM. On P4 internal DRAM is
+ * only ~378 KB total and pixel buffers here would happily eat 100+ KB
+ * across the two map_renderers (marker + AIS pools + tile grid). Plain
+ * malloc() prefers internal DRAM for small allocations and only spills
+ * to PSRAM when internal is short — which starves later consumers
+ * (mDNS task stack, NimBLE pools) that MUST be in DRAM. Use PSRAM_ALLOC
+ * for the pixel bufs so DRAM stays free for things that actually need
+ * it. Large tile bufs (128 KB) already fell back to PSRAM by size, but
+ * the 6.4 KB AIS icon bufs and 4 KB marker buf were slipping into DRAM
+ * per slot. */
+#ifdef ESP_PLATFORM
+#define PSRAM_ALLOC(size) heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
+#define PSRAM_ALLOC(size) malloc(size)
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -20,7 +79,34 @@
 
 #define TILE_PX      256
 #define TILE_BYTES   (TILE_PX * TILE_PX * 2)  /* RGB565 */
-#define ZOOM_MIN     11
+
+/* Track-mode "look-ahead": in tracking mode we don't put the own-boat
+ * marker at dead-centre of the viewport, we bias the map so the
+ * marker lands OPPOSITE to the direction of travel (COG). Result:
+ * more chart is always visible ahead of the vessel, regardless of
+ * heading. Live-boat report: with the previous fixed north-side
+ * anchor, heading south drifted the boat southward into the golden
+ * screen's engine-pod row before the deadband triggered. Course-up
+ * anchor puts the boat NORTH of centre when heading south, so it
+ * drifts back TOWARD centre before it can reach the pods.
+ *
+ * When COG is unknown or the vessel is essentially stationary
+ * (SOG < 0.5 kn) we fall back to dead-centre — no direction-of-travel
+ * to bias against.
+ *
+ * Only affects tracking recentres; set_view / focus_mmsi still put
+ * the passed lat/lon at dead-centre. */
+#define MARKER_ANCHOR_OFFSET_PX      60
+/* SOG below which we treat COG as too noisy to steer the anchor bias.
+ * Bumped from 0.5 (drifting) to 1.5 kn — anything you'd get "in gear"
+ * clears this cleanly, but GPS-derived COG jitter at sub-kn speeds
+ * would make the anchor twitch. */
+#define MARKER_ANCHOR_MIN_SOG_KNOTS  1.5f
+/* z10 was added to the tile pipeline so users can zoom out further
+ * (~4 km / pixel at 45° lat — good for regional context). Anything
+ * beyond z16 would be pointless: the tile source stops there and the
+ * gauge's 800×800 display has no meaningful use for that detail. */
+#define ZOOM_MIN     10
 #define ZOOM_MAX     16
 #define PATH_BUF_LEN 300
 #define GRID_COLS    5
@@ -39,6 +125,8 @@
 #define AIS_VESSEL_PX      40
 #define AIS_ATON_PX        30
 #define AIS_TOUCH_EXTEND   16   /* +16 px on each side → ~72 px touch zone */
+/* Match ais_store's cap. Reverted to 64/16 with the store — see comment
+ * on AIS_MAX_VESSELS in ais_store.h. */
 #define AIS_VESSEL_POOL 64
 #define AIS_ATON_POOL   16
 /* AIS color convention — matches tools/tile_viewer.py for visual parity. */
@@ -46,6 +134,12 @@
 #define AIS_COLOR_B    0xFF50A0FF   /* Class B — blue */
 #define AIS_COLOR_ATON 0xFFFFCC00   /* Yellow diamond */
 #define AIS_COLOR_OUTL 0xFF000000   /* Black outline */
+
+/* Vessels haven't broadcast a position in this long → dim the marker
+ * (and card) to signal "aging". ais_store still prunes at 10 min via
+ * AIS_STALE_AFTER_MS, so the marker vanishes shortly after aging kicks
+ * in. Threshold picked to cover Class B at anchor (3 min cadence). */
+#define AIS_VESSEL_STALE_MS   (4 * 60 * 1000)
 
 struct map_renderer {
     lv_obj_t*  parent;
@@ -69,14 +163,14 @@ struct map_renderer {
     lv_obj_t*  ais_layer;                   /* parent inside map_group */
     bool       ais_enabled;
     /* pool storage — see AIS_VESSEL_POOL / AIS_ATON_POOL below */
-    lv_obj_t*  ais_vessel_imgs[64];
-    lv_draw_buf_t ais_vessel_dbufs[64];
-    uint8_t*   ais_vessel_bufs[64];
-    uint32_t   ais_vessel_mmsis[64];        /* MMSI stored per slot for click lookup */
-    lv_obj_t*  ais_aton_imgs[16];
-    lv_draw_buf_t ais_aton_dbufs[16];
-    uint8_t*   ais_aton_bufs[16];
-    uint32_t   ais_aton_mmsis[16];
+    lv_obj_t*  ais_vessel_imgs[AIS_VESSEL_POOL];
+    lv_draw_buf_t ais_vessel_dbufs[AIS_VESSEL_POOL];
+    uint8_t*   ais_vessel_bufs[AIS_VESSEL_POOL];
+    uint32_t   ais_vessel_mmsis[AIS_VESSEL_POOL];   /* MMSI stored per slot for click lookup */
+    lv_obj_t*  ais_aton_imgs[AIS_ATON_POOL];
+    lv_draw_buf_t ais_aton_dbufs[AIS_ATON_POOL];
+    uint8_t*   ais_aton_bufs[AIS_ATON_POOL];
+    uint32_t   ais_aton_mmsis[AIS_ATON_POOL];
 
     /* Tap-to-inspect info card — created once during map_renderer_create.
      * Populated + shown on AIS click; hidden on chart tap. Content is
@@ -85,8 +179,14 @@ struct map_renderer {
     lv_obj_t*  ais_card_name;
     lv_obj_t*  ais_card_line2;              /* MMSI + class OR AtoN type */
     lv_obj_t*  ais_card_line3;              /* SOG COG BRG DIST (vessel) — BRG/DIST (AtoN) */
+    lv_obj_t*  ais_card_line4;              /* CPA / TCPA (vessels only) */
     uint32_t   ais_selected_mmsi;
     bool       ais_selected_is_aton;        /* true → look up in atons instead */
+
+    /* Small status pill at the top-left of the chart circle showing
+     * where AIS data is coming from (N2K bus / phone / none). */
+    lv_obj_t*  ais_badge;
+    lv_obj_t*  ais_badge_label;
 
     lv_obj_t*  track_btn;
     int32_t    vp_size;
@@ -98,8 +198,17 @@ struct map_renderer {
 
     double     pos_lat, pos_lon;
     float      pos_cog;
+    float      pos_sog_knots;                /* own SOG for CPA/TCPA */
     bool       pos_valid;
     bool       tracking;
+    /* True between PRESSING (with non-zero movement) and RELEASED /
+     * PRESS_LOST — screen_manager reads it to skip refresh_ais while
+     * the user is dragging the chart. Every refresh_ais snapshots the
+     * store and repaints up to POOL widgets; doing that mid-drag
+     * makes the drag stutter for no visible benefit (icons are
+     * already being repositioned by reposition_ais_only inside
+     * apply_pan_offset). */
+    bool       panning;
 
     /* Last view explicitly set via map_renderer_set_view — used as a
      * recenter fallback by map_renderer_track when there's no GPS fix
@@ -175,7 +284,7 @@ static uint16_t* g_missing_template = NULL;
 static void build_missing_template(void)
 {
     if (g_missing_template) return;
-    g_missing_template = (uint16_t*)malloc(TILE_BYTES);
+    g_missing_template = (uint16_t*)PSRAM_ALLOC(TILE_BYTES);
     if (!g_missing_template) return;
 
     /* Background: solid + diagonal hatch (8-px stripes via (x+y)/4 parity). */
@@ -371,8 +480,9 @@ static void vessel_click_cb(lv_event_t *e)
 #ifdef ESP_PLATFORM
     map_renderer_t* mr = (map_renderer_t*)lv_event_get_user_data(e);
     lv_obj_t* target   = lv_event_get_current_target_obj(e);
-    /* Which slot? Linear scan is cheap for 64. */
-    ais_vessel_t vessels[AIS_VESSEL_POOL];
+    /* Which slot? Linear scan is cheap. Reuse the file-scope scratch. */
+    if (!s_ais_v_scratch) return;
+    ais_vessel_t *vessels = s_ais_v_scratch;
     size_t n_v = ais_store_get_vessels(vessels, AIS_VESSEL_POOL);
     for (size_t i = 0; i < AIS_VESSEL_POOL; i++) {
         if (mr->ais_vessel_imgs[i] != target) continue;
@@ -395,7 +505,8 @@ static void aton_click_cb(lv_event_t *e)
 #ifdef ESP_PLATFORM
     map_renderer_t* mr = (map_renderer_t*)lv_event_get_user_data(e);
     lv_obj_t* target   = lv_event_get_current_target_obj(e);
-    ais_aton_t atons[AIS_ATON_POOL];
+    if (!s_ais_a_scratch) return;
+    ais_aton_t *atons = s_ais_a_scratch;
     size_t n_a = ais_store_get_atons(atons, AIS_ATON_POOL);
     for (size_t i = 0; i < AIS_ATON_POOL; i++) {
         if (mr->ais_aton_imgs[i] != target) continue;
@@ -420,7 +531,7 @@ static void aton_click_cb(lv_event_t *e)
 static bool ensure_vessel_slot(map_renderer_t* mr, size_t i)
 {
     if (mr->ais_vessel_imgs[i]) return true;
-    mr->ais_vessel_bufs[i] = (uint8_t*)malloc(AIS_VESSEL_PX * AIS_VESSEL_PX * 4);
+    mr->ais_vessel_bufs[i] = (uint8_t*)PSRAM_ALLOC(AIS_VESSEL_PX * AIS_VESSEL_PX * 4);
     if (!mr->ais_vessel_bufs[i]) return false;
     memset(mr->ais_vessel_bufs[i], 0, AIS_VESSEL_PX * AIS_VESSEL_PX * 4);
     lv_draw_buf_init(&mr->ais_vessel_dbufs[i], AIS_VESSEL_PX, AIS_VESSEL_PX,
@@ -439,7 +550,7 @@ static bool ensure_vessel_slot(map_renderer_t* mr, size_t i)
 static bool ensure_aton_slot(map_renderer_t* mr, size_t i)
 {
     if (mr->ais_aton_imgs[i]) return true;
-    mr->ais_aton_bufs[i] = (uint8_t*)malloc(AIS_ATON_PX * AIS_ATON_PX * 4);
+    mr->ais_aton_bufs[i] = (uint8_t*)PSRAM_ALLOC(AIS_ATON_PX * AIS_ATON_PX * 4);
     if (!mr->ais_aton_bufs[i]) return false;
     memset(mr->ais_aton_bufs[i], 0, AIS_ATON_PX * AIS_ATON_PX * 4);
     lv_draw_buf_init(&mr->ais_aton_dbufs[i], AIS_ATON_PX, AIS_ATON_PX,
@@ -472,6 +583,75 @@ static double range_nm_from_us(map_renderer_t* mr, double tlat, double tlon)
     double dy_m = (tlat - olat) * 110574.0;
     double dx_m = (tlon - olon) * 111320.0 * cos(mid);
     return sqrt(dx_m * dx_m + dy_m * dy_m) / 1852.0;
+}
+
+/* Closest Point of Approach (CPA) between own boat and a moving target,
+ * with the Time to CPA (TCPA). Flat-earth approximation is fine — CPA
+ * is a small-scale calculation (single-digit NM, single-digit minutes).
+ *
+ * Output:
+ *   *cpa_nm    minimum future distance in NM (or current distance if
+ *              targets are diverging / stationary — TCPA <= 0 case)
+ *   *tcpa_min  time until CPA, in minutes; NEGATIVE if targets are
+ *              diverging (no future encounter). NAN when the input is
+ *              too under-determined to answer (no own fix / no own
+ *              SOG / target has neither COG nor SOG).
+ *
+ * Returns false when computation isn't possible (caller should hide the
+ * CPA/TCPA fields on the card). */
+static bool compute_cpa_tcpa(map_renderer_t* mr,
+                             double tlat, double tlon,
+                             float  tsog_knots, float tcog_deg,
+                             float *cpa_nm, float *tcpa_min)
+{
+    if (!mr->pos_valid) return false;
+    if (mr->pos_sog_knots < 0.1f && tsog_knots < 0.1f) return false;
+
+    /* Local ENU (east, north) around own position. */
+    double mid_rad = mr->pos_lat * M_PI / 180.0;
+    double dx_m = (tlon - mr->pos_lon) * 111320.0 * cos(mid_rad);
+    double dy_m = (tlat - mr->pos_lat) * 110574.0;
+
+    /* Velocity vectors in m/s. Compass bearing → math angle:
+     *   east  = sog * sin(cog),  north = sog * cos(cog) */
+    double o_sog_ms = mr->pos_sog_knots * 0.51444;
+    double o_rad    = mr->pos_cog * M_PI / 180.0;
+    double ovx = o_sog_ms * sin(o_rad);
+    double ovy = o_sog_ms * cos(o_rad);
+
+    double t_sog_ms = tsog_knots * 0.51444;
+    double t_rad    = tcog_deg * M_PI / 180.0;
+    double tvx = t_sog_ms * sin(t_rad);
+    double tvy = t_sog_ms * cos(t_rad);
+
+    /* Relative velocity (target minus own). */
+    double rvx = tvx - ovx, rvy = tvy - ovy;
+    double v2 = rvx * rvx + rvy * rvy;
+    double cur_range_m = sqrt(dx_m * dx_m + dy_m * dy_m);
+
+    if (v2 < 1e-6) {
+        /* No relative motion — CPA is the current range, TCPA irrelevant. */
+        *cpa_nm   = (float)(cur_range_m / 1852.0);
+        *tcpa_min = 0.0f;
+        return true;
+    }
+
+    /* t* = -(r0 · rv) / |rv|²  →  seconds. */
+    double t_s = -(dx_m * rvx + dy_m * rvy) / v2;
+
+    if (t_s < 0.0) {
+        /* Diverging — negative TCPA. Report current range as CPA. */
+        *cpa_nm   = (float)(cur_range_m / 1852.0);
+        *tcpa_min = (float)(t_s / 60.0);
+        return true;
+    }
+
+    /* Closest point along the future relative track. */
+    double cx = dx_m + rvx * t_s;
+    double cy = dy_m + rvy * t_s;
+    *cpa_nm   = (float)(sqrt(cx * cx + cy * cy) / 1852.0);
+    *tcpa_min = (float)(t_s / 60.0);
+    return true;
 }
 
 /* True bearing (0..360°) from own boat to target. */
@@ -508,13 +688,24 @@ static void build_ais_card(map_renderer_t* mr)
     lv_obj_t* chart_area = lv_obj_get_parent(mr->map_container);
     lv_obj_t* root       = lv_obj_get_parent(chart_area);
     lv_obj_t* card = lv_obj_create(root);
-    /* Width sized to the chart_area (visible round area) with margin. */
-    int32_t w = (mr->vp_size * 82) / 100;
-    lv_obj_set_size(card, w, 96);
-    /* Position at the bottom of the visible chart circle. */
-    /* Sit ~90 px higher than the very bottom so the card doesn't touch
-     * (or hide behind) the golden screen's pod row / SOG-COG overlay. */
-    lv_obj_align_to(card, chart_area, LV_ALIGN_BOTTOM_MID, 0, -90);
+    /* Width + vertical offset are sized so BOTH bottom corners land
+     * inside the 400-px round physical bezel with margin. On the
+     * 800-px full-chart tile the naive 82%-of-viewport sizing pushed
+     * card corners to ~451 px from screen centre — outside the bezel,
+     * so the user saw the card's bottom-left / bottom-right corners
+     * clipped by the panel. On the 600-px golden inset the same
+     * proportions still fit because chart_area sits inset 100 px from
+     * each side. Branch on viewport size. */
+    int32_t w, y_off;
+    if (mr->vp_size >= 800) {
+        w = 560;         /* corners at (140,600)/(660,600) → 344 px from centre */
+        y_off = -200;    /* card bottom at y=600; top at y=482 */
+    } else {
+        w = (mr->vp_size * 82) / 100;
+        y_off = -90;
+    }
+    lv_obj_set_size(card, w, 118);   /* +22 px for the CPA/TCPA line */
+    lv_obj_align_to(card, chart_area, LV_ALIGN_BOTTOM_MID, 0, y_off);
     lv_obj_set_style_radius(card, 12, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(0x0e1520), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -554,6 +745,13 @@ static void build_ais_card(map_renderer_t* mr)
     lv_label_set_text(l3, "");
     mr->ais_card_line3 = l3;
 
+    lv_obj_t* l4 = lv_label_create(card);
+    lv_obj_set_style_text_color(l4, lv_color_hex(0xffcc00), 0);   /* alert-yellow */
+    lv_obj_set_style_text_font(l4, &lv_font_montserrat_16, 0);
+    lv_obj_align(l4, LV_ALIGN_TOP_LEFT, 4, 82);
+    lv_label_set_text(l4, "");
+    mr->ais_card_line4 = l4;
+
     /* × close button, top-right */
     lv_obj_t* close = lv_button_create(card);
     lv_obj_set_size(close, 34, 34);
@@ -567,6 +765,30 @@ static void build_ais_card(map_renderer_t* mr)
     lv_obj_center(x);
 }
 
+/* Human-friendly age string: "3 s ago" / "12 min ago" / "1.4 h ago".
+ * Writes into `dst` (buffer of at least 24 chars). */
+static void format_age(char *dst, size_t cap, uint32_t age_ms)
+{
+    if (age_ms < 60000) {
+        snprintf(dst, cap, "%lu s ago", (unsigned long)(age_ms / 1000));
+    } else if (age_ms < 3600000) {
+        snprintf(dst, cap, "%lu min ago", (unsigned long)(age_ms / 60000));
+    } else {
+        snprintf(dst, cap, "%.1f h ago", age_ms / 3600000.0);
+    }
+}
+
+#ifndef ESP_PLATFORM
+/* Sim: no esp_timer / ais_store — stub the card populators. Called sites
+ * are all inside ESP_PLATFORM guards; the stubs exist purely so the
+ * forward decls at file top resolve. */
+static void show_ais_card_vessel(map_renderer_t* mr, const ais_vessel_t *v) { (void)mr; (void)v; }
+static void show_ais_card_aton  (map_renderer_t* mr, const ais_aton_t   *a) { (void)mr; (void)a; }
+static void refresh_ais_badge(map_renderer_t* mr,
+                              const ais_vessel_t *vessels, size_t n_v,
+                              const ais_aton_t   *atons,   size_t n_a)
+{ (void)mr; (void)vessels; (void)n_v; (void)atons; (void)n_a; }
+#else
 static void show_ais_card_vessel(map_renderer_t* mr, const ais_vessel_t *v)
 {
     if (!mr->ais_card) return;
@@ -575,8 +797,12 @@ static void show_ais_card_vessel(map_renderer_t* mr, const ais_vessel_t *v)
     const char *class_str = v->is_class_a ? "Class A" : "Class B";
     lv_label_set_text(mr->ais_card_name,
                       (v->name[0] ? v->name : "(unknown)"));
-    lv_label_set_text_fmt(mr->ais_card_line2, "MMSI %lu  •  %s",
-                          (unsigned long)v->mmsi, class_str);
+
+    char age[24];
+    format_age(age, sizeof(age),
+               (uint32_t)(esp_timer_get_time() / 1000) - v->pos_update_ms);
+    lv_label_set_text_fmt(mr->ais_card_line2, "MMSI %lu  •  %s  •  %s",
+                          (unsigned long)v->mmsi, class_str, age);
     double rng = range_nm_from_us(mr, v->lat, v->lon);
     float  brg = bearing_from_us(mr, v->lat, v->lon);
     if (rng >= 0 && !isnan(brg)) {
@@ -588,6 +814,34 @@ static void show_ais_card_vessel(map_renderer_t* mr, const ais_vessel_t *v)
             "SOG %.1f kn   COG %.0f°",
             v->sog_knots, v->cog_deg);
     }
+
+    /* If the target hasn't reported recently, prefer a staleness note over
+     * CPA/TCPA — the last-known SOG/COG might be minutes old, so CPA math
+     * on those values would be misleading. */
+    uint32_t age_ms = (uint32_t)(esp_timer_get_time() / 1000) - v->pos_update_ms;
+    if (age_ms > AIS_VESSEL_STALE_MS) {
+        lv_label_set_text_fmt(mr->ais_card_line4,
+            "STALE   last seen %lu min ago",
+            (unsigned long)(age_ms / 60000));
+    } else {
+        float cpa_nm, tcpa_min;
+        if (compute_cpa_tcpa(mr, v->lat, v->lon, v->sog_knots, v->cog_deg,
+                             &cpa_nm, &tcpa_min)) {
+            if (tcpa_min < 0.0f) {
+                lv_label_set_text_fmt(mr->ais_card_line4,
+                    "CPA %.2f NM   diverging", cpa_nm);
+            } else if (tcpa_min < 60.0f) {
+                lv_label_set_text_fmt(mr->ais_card_line4,
+                    "CPA %.2f NM   TCPA %.0f min", cpa_nm, tcpa_min);
+            } else {
+                lv_label_set_text_fmt(mr->ais_card_line4,
+                    "CPA %.2f NM   TCPA %.1f h", cpa_nm, tcpa_min / 60.0f);
+            }
+        } else {
+            lv_label_set_text(mr->ais_card_line4, "");
+        }
+    }
+
     lv_obj_remove_flag(mr->ais_card, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(mr->ais_card);   /* above sibling pods/dial */
 }
@@ -599,9 +853,14 @@ static void show_ais_card_aton(map_renderer_t* mr, const ais_aton_t *a)
     mr->ais_selected_is_aton  = true;
     lv_label_set_text(mr->ais_card_name,
                       (a->name[0] ? a->name : "(unnamed)"));
-    lv_label_set_text_fmt(mr->ais_card_line2, "MMSI %lu  •  AtoN%s",
+
+    char age[24];
+    format_age(age, sizeof(age),
+               (uint32_t)(esp_timer_get_time() / 1000) - a->pos_update_ms);
+    lv_label_set_text_fmt(mr->ais_card_line2, "MMSI %lu  •  AtoN%s  •  %s",
                           (unsigned long)a->mmsi,
-                          a->virtual_aton ? " (virtual)" : "");
+                          a->virtual_aton ? " (virtual)" : "",
+                          age);
     double rng = range_nm_from_us(mr, a->lat, a->lon);
     float  brg = bearing_from_us(mr, a->lat, a->lon);
     if (rng >= 0 && !isnan(brg))
@@ -609,9 +868,11 @@ static void show_ais_card_aton(map_renderer_t* mr, const ais_aton_t *a)
             "BRG %.0f°   D %.2f NM", brg, rng);
     else
         lv_label_set_text(mr->ais_card_line3, "");
+    lv_label_set_text(mr->ais_card_line4, "");    /* no CPA/TCPA for AtoN */
     lv_obj_remove_flag(mr->ais_card, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(mr->ais_card);
 }
+#endif  /* ESP_PLATFORM — show_ais_card_* real bodies */
 
 static void hide_ais_card(map_renderer_t* mr)
 {
@@ -626,6 +887,91 @@ static void chart_tap_dismiss_cb(lv_event_t *e)
     if (mr->ais_card && !lv_obj_has_flag(mr->ais_card, LV_OBJ_FLAG_HIDDEN))
         hide_ais_card(mr);
 }
+
+/* AIS source badge — a tiny status pill parked at the top of the chart
+ * that lights up when AIS data is currently flowing (any store entry
+ * updated within the last 15 s) and turns dim grey when the store goes
+ * cold. Also names the source: "BLE" (phone bridge only), "N2K" (wired
+ * receiver only), or "MIX" (both feeding the store) — routing decisions
+ * (n2k_ais_tx skips N2K-sourced records) hinge on it, so surfacing it
+ * saves the operator wondering why targets show or don't show on other
+ * MFDs on the bus. */
+#define AIS_BADGE_ACTIVE_WINDOW_MS   15000
+
+static void build_ais_badge(map_renderer_t* mr)
+{
+    lv_obj_t* chart_area = lv_obj_get_parent(mr->map_container);
+    lv_obj_t* root       = lv_obj_get_parent(chart_area);
+
+    lv_obj_t* badge = lv_obj_create(root);
+    lv_obj_set_size(badge, 100, 26);
+    lv_obj_align_to(badge, chart_area, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, lv_color_hex(0x21262d), 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(badge, 1, 0);
+    lv_obj_set_style_border_color(badge, lv_color_hex(0x3a4150), 0);
+    lv_obj_set_style_pad_all(badge, 2, 0);
+    lv_obj_remove_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    mr->ais_badge = badge;
+
+    lv_obj_t* lbl = lv_label_create(badge);
+    lv_label_set_text(lbl, "AIS --");
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0x8b949e), 0);
+    lv_obj_center(lbl);
+    mr->ais_badge_label = lbl;
+}
+
+/* Count records per source in the two snapshots. Cheap: pools cap at
+ * AIS_MAX_VESSELS + AIS_MAX_ATONS = 80 items in the worst case. */
+static void tally_sources(const ais_vessel_t *vessels, size_t n_v,
+                          const ais_aton_t   *atons,   size_t n_a,
+                          size_t *n_ble, size_t *n_n2k)
+{
+    size_t ble = 0, n2k = 0;
+    for (size_t i = 0; i < n_v; i++) {
+        if      (vessels[i].source == AIS_SOURCE_BLE) ble++;
+        else if (vessels[i].source == AIS_SOURCE_N2K) n2k++;
+    }
+    for (size_t i = 0; i < n_a; i++) {
+        if      (atons[i].source == AIS_SOURCE_BLE) ble++;
+        else if (atons[i].source == AIS_SOURCE_N2K) n2k++;
+    }
+    *n_ble = ble; *n_n2k = n2k;
+}
+
+#ifdef ESP_PLATFORM  /* refresh_ais_badge real body — see stub above for sim */
+static void refresh_ais_badge(map_renderer_t* mr,
+                              const ais_vessel_t *vessels, size_t n_v,
+                              const ais_aton_t   *atons,   size_t n_a)
+{
+    if (!mr->ais_badge_label) return;
+    uint32_t now    = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t last   = ais_store_last_update_ms();
+    bool     active = (last != 0) && ((now - last) < AIS_BADGE_ACTIVE_WINDOW_MS);
+    size_t   total  = n_v + n_a;
+
+    if (active) {
+        size_t n_ble, n_n2k;
+        tally_sources(vessels, n_v, atons, n_a, &n_ble, &n_n2k);
+
+        const char *src;
+        if      (n_ble && n_n2k) src = "MIX";
+        else if (n_ble)          src = "BLE";
+        else if (n_n2k)          src = "N2K";
+        else                     src = "?";
+        lv_label_set_text_fmt(mr->ais_badge_label, "AIS %s %zu", src, total);
+        lv_obj_set_style_text_color(mr->ais_badge_label, lv_color_hex(0x00d4ff), 0);
+        lv_obj_set_style_border_color(mr->ais_badge, lv_color_hex(0x00d4ff), 0);
+    } else {
+        lv_label_set_text(mr->ais_badge_label, "AIS --");
+        lv_obj_set_style_text_color(mr->ais_badge_label, lv_color_hex(0x8b949e), 0);
+        lv_obj_set_style_border_color(mr->ais_badge, lv_color_hex(0x3a4150), 0);
+    }
+}
+#endif  /* ESP_PLATFORM — refresh_ais_badge real body */
 
 static void init_ais_pool(map_renderer_t* mr)
 {
@@ -644,42 +990,68 @@ static void init_ais_pool(map_renderer_t* mr)
     mr->ais_layer = NULL;   /* unused with lazy scheme */
     mr->ais_enabled = true;
     mr->ais_card = NULL;
+    mr->ais_badge = NULL;
+    mr->ais_badge_label = NULL;
     mr->ais_selected_mmsi = 0;
     mr->ais_selected_is_aton = false;
     build_ais_card(mr);
+    build_ais_badge(mr);
 }
 
 /* Reposition existing AIS widgets only. Safe to call from apply_pan_offset
  * during a drag — no LVGL widget creation, so no risk of tree corruption
- * while an event handler is iterating children. */
+ * while an event handler is iterating children. Walks by SLOT (matching
+ * the MMSI stored in mr->ais_vessel_mmsis[s]) so the same widget stays
+ * with the same vessel across pans and refreshes. Earlier this iterated
+ * by packed snapshot index, which undid refresh_ais's MMSI keying and
+ * caused visible blinking when the store re-packed. */
 static void reposition_ais_only(map_renderer_t* mr)
 {
 #ifndef ESP_PLATFORM
     (void)mr;
 #else
     if (!mr || !mr->ais_enabled || !mr->map_group) return;
-    ais_vessel_t vessels[AIS_VESSEL_POOL];
-    ais_aton_t   atons  [AIS_ATON_POOL];
+    if (!s_ais_v_scratch || !s_ais_a_scratch) return;
+    ais_vessel_t *vessels = s_ais_v_scratch;
+    ais_aton_t   *atons   = s_ais_a_scratch;
     size_t n_v = ais_store_get_vessels(vessels, AIS_VESSEL_POOL);
     size_t n_a = ais_store_get_atons  (atons,   AIS_ATON_POOL);
 
-    for (size_t i = 0; i < n_v; i++) {
-        if (!mr->ais_vessel_imgs[i]) continue;   /* not yet allocated */
-        double vtx, vty;
-        lat_lon_to_tile(vessels[i].lat, vessels[i].lon, mr->current_zoom, &vtx, &vty);
-        int32_t gx = mr->vp_size / 2 + (int32_t)((vtx - mr->center_tx) * TILE_PX);
-        int32_t gy = mr->vp_size / 2 + (int32_t)((vty - mr->center_ty) * TILE_PX);
-        lv_obj_set_pos(mr->ais_vessel_imgs[i],
-                       gx - AIS_VESSEL_PX / 2, gy - AIS_VESSEL_PX / 2);
+    for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+        if (!mr->ais_vessel_imgs[s]) continue;
+        uint32_t mmsi = mr->ais_vessel_mmsis[s];
+        if (!mmsi) continue;
+        for (size_t i = 0; i < n_v; i++) {
+            if (vessels[i].mmsi != mmsi) continue;
+            /* Skip if static-only (no position yet) — the widget was
+             * showing this vessel at its last real position; leave it
+             * put until refresh_ais gets a proper coord. */
+            if (isnan(vessels[i].lat) || isnan(vessels[i].lon)) break;
+            double vtx, vty;
+            lat_lon_to_tile(vessels[i].lat, vessels[i].lon,
+                            mr->current_zoom, &vtx, &vty);
+            int32_t gx = mr->vp_size / 2 + (int32_t)((vtx - mr->center_tx) * TILE_PX);
+            int32_t gy = mr->vp_size / 2 + (int32_t)((vty - mr->center_ty) * TILE_PX);
+            lv_obj_set_pos(mr->ais_vessel_imgs[s],
+                           gx - AIS_VESSEL_PX / 2, gy - AIS_VESSEL_PX / 2);
+            break;
+        }
     }
-    for (size_t i = 0; i < n_a; i++) {
-        if (!mr->ais_aton_imgs[i]) continue;
-        double atx, aty;
-        lat_lon_to_tile(atons[i].lat, atons[i].lon, mr->current_zoom, &atx, &aty);
-        int32_t gx = mr->vp_size / 2 + (int32_t)((atx - mr->center_tx) * TILE_PX);
-        int32_t gy = mr->vp_size / 2 + (int32_t)((aty - mr->center_ty) * TILE_PX);
-        lv_obj_set_pos(mr->ais_aton_imgs[i],
-                       gx - AIS_ATON_PX / 2, gy - AIS_ATON_PX / 2);
+    for (int32_t s = 0; s < AIS_ATON_POOL; s++) {
+        if (!mr->ais_aton_imgs[s]) continue;
+        uint32_t mmsi = mr->ais_aton_mmsis[s];
+        if (!mmsi) continue;
+        for (size_t i = 0; i < n_a; i++) {
+            if (atons[i].mmsi != mmsi) continue;
+            double atx, aty;
+            lat_lon_to_tile(atons[i].lat, atons[i].lon,
+                            mr->current_zoom, &atx, &aty);
+            int32_t gx = mr->vp_size / 2 + (int32_t)((atx - mr->center_tx) * TILE_PX);
+            int32_t gy = mr->vp_size / 2 + (int32_t)((aty - mr->center_ty) * TILE_PX);
+            lv_obj_set_pos(mr->ais_aton_imgs[s],
+                           gx - AIS_ATON_PX / 2, gy - AIS_ATON_PX / 2);
+            break;
+        }
     }
 #endif
 }
@@ -694,39 +1066,143 @@ void map_renderer_refresh_ais(map_renderer_t* mr)
 
     /* Snapshot the store. Pool is the upper bound; extra targets are
      * silently dropped — they'll appear next refresh if pool space frees. */
-    ais_vessel_t vessels[AIS_VESSEL_POOL];
-    ais_aton_t   atons  [AIS_ATON_POOL];
+    /* static: 128 × sizeof(ais_vessel_t) = ~15 KB per array, way too
+     * much for the 32 KB LVGL task stack when multiple render paths
+     * (refresh_ais, reposition_ais_only, click callbacks) can nest via
+     * event dispatch. Only ever read from the LVGL task, so a shared
+     * static is safe. */
+    ais_vessel_t *vessels = s_ais_v_scratch;
+    ais_aton_t   *atons   = s_ais_a_scratch;
     size_t n_v = ais_store_get_vessels(vessels, AIS_VESSEL_POOL);
     size_t n_a = ais_store_get_atons  (atons,   AIS_ATON_POOL);
 
-    /* Vessels: allocate the widget slot on first use, draw the COG-oriented
-     * triangle, position in map_group coordinates. Slots beyond n_v get
-     * hidden if they were used previously. */
-    for (size_t i = 0; i < AIS_VESSEL_POOL; i++) {
-        if (i >= n_v) {
-            if (mr->ais_vessel_imgs[i])
-                lv_obj_add_flag(mr->ais_vessel_imgs[i], LV_OBJ_FLAG_HIDDEN);
+    uint32_t now_ms_local = (uint32_t)(esp_timer_get_time() / 1000);
+
+    /* Vessels: renderer slots are keyed by MMSI, NOT by the packed snapshot
+     * index. If we blindly used slot i = vessels[i], any prune / add in the
+     * store shifted the packed order and each renderer slot re-drew a
+     * different vessel every refresh — user-visible as groups of icons
+     * blinking every ~2 s. Keying by MMSI keeps a vessel at the SAME
+     * widget across refreshes, so LVGL only invalidates its actual
+     * position change; nothing blinks. */
+    bool slot_touched[AIS_VESSEL_POOL] = {false};
+#if AIS_BLINK_DEBUG
+    /* Save the pre-refresh state so we can log transitions after the loop. */
+    uint32_t pre_mmsis[AIS_VESSEL_POOL];
+    bool     pre_hidden[AIS_VESSEL_POOL];
+    for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+        pre_mmsis[s]  = mr->ais_vessel_mmsis[s];
+        pre_hidden[s] = mr->ais_vessel_imgs[s]
+                      ? lv_obj_has_flag(mr->ais_vessel_imgs[s], LV_OBJ_FLAG_HIDDEN)
+                      : true;
+    }
+    int dbg_nan_skipped = 0, dbg_new_slot = 0, dbg_mmsi_moved = 0, dbg_hidden = 0;
+#endif
+    for (size_t v_idx = 0; v_idx < n_v; v_idx++) {
+        const ais_vessel_t *v = &vessels[v_idx];
+
+        /* Skip static-info-only entries (name / call-sign arrived from a
+         * PGN 129809/129810 before any position). alloc_vessel seeds
+         * lat/lon = NAN for these; without this guard we'd project NaN
+         * through lat_lon_to_tile → undefined int cast → widget placed at
+         * garbage screen coords, and the next refresh (when the position
+         * finally arrives) would relocate it — the user-visible blink.
+         * Slot stays HELD by this MMSI: if the widget was previously
+         * showing this vessel at a real position, mark the slot touched
+         * so cleanup doesn't hide it. */
+        if (isnan(v->lat) || isnan(v->lon)) {
+            for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+                if (mr->ais_vessel_mmsis[s] == v->mmsi) {
+                    slot_touched[s] = true;
+                    break;
+                }
+            }
+#if AIS_BLINK_DEBUG
+            dbg_nan_skipped++;
+#endif
             continue;
         }
-        if (!ensure_vessel_slot(mr, i)) continue;
-        const ais_vessel_t *v = &vessels[i];
-        mr->ais_vessel_mmsis[i] = v->mmsi;
+
+        /* Find the slot already holding this MMSI. */
+        int32_t slot = -1;
+        for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+            if (mr->ais_vessel_mmsis[s] == v->mmsi) { slot = s; break; }
+        }
+        /* First time we see this MMSI — take an empty (mmsi=0) slot. */
+        if (slot < 0) {
+            for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+                if (mr->ais_vessel_mmsis[s] == 0 && !slot_touched[s]) {
+                    slot = s; break;
+                }
+            }
+        }
+        if (slot < 0) continue;                     /* pool full — drop */
+        if (!ensure_vessel_slot(mr, (size_t)slot)) continue;
+
+        slot_touched[slot] = true;
+        mr->ais_vessel_mmsis[slot] = v->mmsi;
+
         float heading = !isnan(v->heading_deg) ? v->heading_deg : v->cog_deg;
         uint32_t color = v->is_class_a ? AIS_COLOR_A : AIS_COLOR_B;
-        draw_vessel(mr->ais_vessel_bufs[i], heading, color);
+        draw_vessel(mr->ais_vessel_bufs[slot], heading, color);
+
+        /* Dim the marker if we haven't heard from this target recently.
+         * The store still prunes at AIS_STALE_AFTER_MS; this is the
+         * "aging" state between fresh and gone. */
+        bool stale = (now_ms_local - v->pos_update_ms) > AIS_VESSEL_STALE_MS;
+        lv_obj_set_style_opa(mr->ais_vessel_imgs[slot],
+                             stale ? LV_OPA_40 : LV_OPA_COVER, 0);
 
         double vtx, vty;
         lat_lon_to_tile(v->lat, v->lon, mr->current_zoom, &vtx, &vty);
-        /* Same viewport-relative frame as marker/tiles — pans + boundary
-         * shifts keep AIS aligned with the chart underneath. */
         int32_t gx = mr->vp_size / 2 + (int32_t)((vtx - mr->center_tx) * TILE_PX);
         int32_t gy = mr->vp_size / 2 + (int32_t)((vty - mr->center_ty) * TILE_PX);
-        lv_obj_set_pos(mr->ais_vessel_imgs[i],
+        lv_obj_set_pos(mr->ais_vessel_imgs[slot],
                        gx - AIS_VESSEL_PX / 2, gy - AIS_VESSEL_PX / 2);
-        lv_draw_buf_invalidate_cache(&mr->ais_vessel_dbufs[i], NULL);
-        lv_obj_remove_flag(mr->ais_vessel_imgs[i], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_invalidate(mr->ais_vessel_imgs[i]);
+        lv_draw_buf_invalidate_cache(&mr->ais_vessel_dbufs[slot], NULL);
+        lv_obj_remove_flag(mr->ais_vessel_imgs[slot], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(mr->ais_vessel_imgs[slot]);
     }
+    /* Any slot that had a widget last cycle but wasn't touched this cycle
+     * belongs to a vessel that dropped out of the snapshot (pruned as
+     * stale, or bumped from a full store). Hide the widget and clear the
+     * MMSI so the slot is reusable for a future arrival. */
+    for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+        if (!slot_touched[s] && mr->ais_vessel_imgs[s]) {
+            lv_obj_add_flag(mr->ais_vessel_imgs[s], LV_OBJ_FLAG_HIDDEN);
+            mr->ais_vessel_mmsis[s] = 0;
+#if AIS_BLINK_DEBUG
+            dbg_hidden++;
+#endif
+        }
+    }
+#if AIS_BLINK_DEBUG
+    /* Post-refresh diff: what actually changed slot-by-slot? Only log
+     * transitions (something changed) — a steady state where nothing
+     * moved should be silent. Cheap: max 64 comparisons. */
+    for (int32_t s = 0; s < AIS_VESSEL_POOL; s++) {
+        uint32_t post_mmsi = mr->ais_vessel_mmsis[s];
+        bool post_hidden = mr->ais_vessel_imgs[s]
+                         ? lv_obj_has_flag(mr->ais_vessel_imgs[s], LV_OBJ_FLAG_HIDDEN)
+                         : true;
+        if (post_mmsi != pre_mmsis[s]) {
+            if (pre_mmsis[s] == 0) dbg_new_slot++;
+            else                   dbg_mmsi_moved++;
+            ESP_LOGI(AIS_DBG_TAG, "slot %ld  mmsi %lu -> %lu  (hidden %d -> %d)",
+                     (long)s, (unsigned long)pre_mmsis[s], (unsigned long)post_mmsi,
+                     (int)pre_hidden[s], (int)post_hidden);
+        } else if (post_hidden != pre_hidden[s]) {
+            ESP_LOGI(AIS_DBG_TAG, "slot %ld  mmsi %lu  hidden %d -> %d",
+                     (long)s, (unsigned long)post_mmsi,
+                     (int)pre_hidden[s], (int)post_hidden);
+        }
+    }
+    /* Summary per refresh so we can see cadence + volume at a glance. */
+    ESP_LOGI(AIS_DBG_TAG, "refresh: n_v=%zu n_a=%zu nan_skipped=%d "
+                          "new_slot=%d mmsi_moved=%d hidden=%d vp=%d",
+             n_v, n_a, dbg_nan_skipped, dbg_new_slot, dbg_mmsi_moved, dbg_hidden,
+             (int)mr->vp_size);
+#endif
 
     /* Live-refresh the open info card so name/COG/SOG/BRG/D stay current
      * without needing the user to close and re-tap. Reuses the snapshot
@@ -741,23 +1217,41 @@ void map_renderer_refresh_ais(map_renderer_t* mr)
         }
     }
 
-    /* AtoN: same lazy-alloc pattern, but shape is fixed so we just place. */
-    for (size_t i = 0; i < AIS_ATON_POOL; i++) {
-        if (i >= n_a) {
-            if (mr->ais_aton_imgs[i])
-                lv_obj_add_flag(mr->ais_aton_imgs[i], LV_OBJ_FLAG_HIDDEN);
-            continue;
+    /* AtoN: keyed by MMSI, same reason as the vessel loop above. */
+    bool aton_touched[AIS_ATON_POOL] = {false};
+    for (size_t a_idx = 0; a_idx < n_a; a_idx++) {
+        const ais_aton_t *a = &atons[a_idx];
+
+        int32_t slot = -1;
+        for (int32_t s = 0; s < AIS_ATON_POOL; s++) {
+            if (mr->ais_aton_mmsis[s] == a->mmsi) { slot = s; break; }
         }
-        if (!ensure_aton_slot(mr, i)) continue;
-        const ais_aton_t *a = &atons[i];
-        mr->ais_aton_mmsis[i] = a->mmsi;
+        if (slot < 0) {
+            for (int32_t s = 0; s < AIS_ATON_POOL; s++) {
+                if (mr->ais_aton_mmsis[s] == 0 && !aton_touched[s]) {
+                    slot = s; break;
+                }
+            }
+        }
+        if (slot < 0) continue;
+        if (!ensure_aton_slot(mr, (size_t)slot)) continue;
+
+        aton_touched[slot] = true;
+        mr->ais_aton_mmsis[slot] = a->mmsi;
+
         double atx, aty;
         lat_lon_to_tile(a->lat, a->lon, mr->current_zoom, &atx, &aty);
         int32_t gx = mr->vp_size / 2 + (int32_t)((atx - mr->center_tx) * TILE_PX);
         int32_t gy = mr->vp_size / 2 + (int32_t)((aty - mr->center_ty) * TILE_PX);
-        lv_obj_set_pos(mr->ais_aton_imgs[i],
+        lv_obj_set_pos(mr->ais_aton_imgs[slot],
                        gx - AIS_ATON_PX / 2, gy - AIS_ATON_PX / 2);
-        lv_obj_remove_flag(mr->ais_aton_imgs[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(mr->ais_aton_imgs[slot], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int32_t s = 0; s < AIS_ATON_POOL; s++) {
+        if (!aton_touched[s] && mr->ais_aton_imgs[s]) {
+            lv_obj_add_flag(mr->ais_aton_imgs[s], LV_OBJ_FLAG_HIDDEN);
+            mr->ais_aton_mmsis[s] = 0;
+        }
     }
 
     /* AtoN branch of live-refresh: same idea, using the AtoN snapshot. */
@@ -770,30 +1264,36 @@ void map_renderer_refresh_ais(map_renderer_t* mr)
             }
         }
     }
+
+    refresh_ais_badge(mr, vessels, n_v, atons, n_a);
 #endif /* ESP_PLATFORM */
 }
 
 /* ── Grid boundary detection and shifting ── */
 
+/* Ensure the grid covers the current centre and every tile widget is
+ * positioned correctly. If the centre has drifted past the safe band
+ * inside the 5×5 grid, shift grid_origin (integer tile step) and
+ * reload the 25 tile buffers. Always ends with a single
+ * apply_pan_offset — this is important, callers must NOT call
+ * apply_pan_offset (or center_scroll_on_view) separately for the same
+ * centre change: doing so left an intermediate state visible to the
+ * parallel LV draw thread, and the user reported tiles occasionally
+ * appearing vertically shifted after a recentre. */
 static void check_grid_boundary(map_renderer_t* mr)
 {
     if (!mr->map_container) return;
 
     double offset_x = mr->center_tx - mr->grid_origin_tx;
     double offset_y = mr->center_ty - mr->grid_origin_ty;
-    bool need_reload = false;
 
     if (offset_x < 1.5 || offset_x > GRID_COLS - 1.5 ||
         offset_y < 1.5 || offset_y > GRID_ROWS - 1.5) {
         mr->grid_origin_tx = (int32_t)floor(mr->center_tx) - GRID_COLS / 2;
         mr->grid_origin_ty = (int32_t)floor(mr->center_ty) - GRID_ROWS / 2;
-        need_reload = true;
-    }
-
-    if (need_reload) {
         load_grid_tiles(mr);
-        apply_pan_offset(mr);
     }
+    apply_pan_offset(mr);
 }
 
 /* ── Position marker ── */
@@ -963,8 +1463,21 @@ static void drag_cb(lv_event_t* e)
     lv_event_code_t code = lv_event_get_code(e);
 
     if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        mr->panning = false;
         check_grid_boundary(mr);
         prefetch_if_cached(mr);
+#ifdef ESP_PLATFORM
+        /* User just finished dragging this map — it's the currently-
+         * visible one, so its bbox is what determines what AIS the
+         * user should be seeing. Push it to the store; incoming
+         * updates outside the bbox get dropped, and vessels already
+         * out of view get pruned. Stops the LRU churn when the AIS
+         * source (BLE / N2K) is feeding a much wider area. */
+        map_viewport_bbox_t bb;
+        map_renderer_get_viewport_bbox(mr, &bb);
+        ais_store_set_viewport(bb.lat_min, bb.lat_max,
+                               bb.lon_min, bb.lon_max);
+#endif
         return;
     }
     if (code != LV_EVENT_PRESSING) return;
@@ -974,6 +1487,7 @@ static void drag_cb(lv_event_t* e)
     lv_indev_get_vect(indev, &vect);
     if (vect.x == 0 && vect.y == 0) return;
 
+    mr->panning = true;
     mr->tracking = false;
     show_track_btn(mr, true);
 
@@ -1032,6 +1546,14 @@ static void theme_btn_cb(lv_event_t* e)
 
 map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int32_t viewport_size)
 {
+#ifdef ESP_PLATFORM
+    /* Once-only PSRAM allocation for the shared AIS snapshot scratch —
+     * we call it here (rather than lazy per-refresh) so the memory is
+     * definitely available before any refresh_ais / reposition path
+     * can run. If PSRAM alloc fails (highly unlikely), refresh_ais
+     * and friends silently no-op via the null guard at each site. */
+    ensure_ais_scratch();
+#endif
     map_renderer_t* mr = (map_renderer_t*)lv_malloc(sizeof(map_renderer_t));
     if (!mr) return NULL;
     memset(mr, 0, sizeof(*mr));
@@ -1065,7 +1587,7 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
     mr->marker_buf = NULL;
 
     for (int32_t i = 0; i < GRID_TILES; i++) {
-        mr->tile_bufs[i] = (uint8_t*)malloc(TILE_BYTES);
+        mr->tile_bufs[i] = (uint8_t*)PSRAM_ALLOC(TILE_BYTES);
         if (!mr->tile_bufs[i]) {
             for (int32_t j = 0; j < i; j++) free(mr->tile_bufs[j]);
             lv_free(mr);
@@ -1091,7 +1613,7 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
     /* Position marker (vessel arrow), created after the tiles so it draws on
      * top. Small ARGB8888 image (MARKER_SIZE px) so the per-update blend is
      * cheap. update_marker_position() draws the COG-oriented triangle. */
-    mr->marker_buf = (uint8_t*)malloc(MARKER_SIZE * MARKER_SIZE * 4);
+    mr->marker_buf = (uint8_t*)PSRAM_ALLOC(MARKER_SIZE * MARKER_SIZE * 4);
     if (mr->marker_buf) {
         memset(mr->marker_buf, 0, MARKER_SIZE * MARKER_SIZE * 4);
         lv_draw_buf_init(&mr->marker_dbuf, MARKER_SIZE, MARKER_SIZE,
@@ -1135,6 +1657,19 @@ map_renderer_t* map_renderer_create(lv_obj_t* parent, const char* tile_base, int
     lv_obj_add_event_cb(touch_target, chart_tap_dismiss_cb,
                         LV_EVENT_SHORT_CLICKED, mr);
 
+    /* Move the transparent touch_target to the BACK of chart_area so
+     * LVGL's hit-testing checks map_container's AIS-icon children FIRST.
+     * Without this the touch_target (created last → topmost sibling)
+     * intercepts every tap and vessel_click_cb never fires on the full
+     * chart. AIS icons are children of map_container which is
+     * non-clickable but has clickable descendants — LVGL descends into
+     * it, hits the icon, dispatches vessel_click_cb. If the tap misses
+     * every icon, LVGL falls back to the sibling behind it
+     * (touch_target) which then handles drag / tap-dismiss. */
+    if (touch_target != mr->map_container) {
+        lv_obj_move_background(touch_target);
+    }
+
     mr->track_btn = NULL;
     return mr;
 }
@@ -1177,6 +1712,13 @@ void map_renderer_set_view(map_renderer_t* mr, double lat, double lon, int32_t z
     prefetch_if_cached(mr);
 }
 
+/* FIXME: violates the "check_grid_boundary is the single settle" invariant
+ * the rest of this file now upholds. Today no live caller passes a
+ * (dx, dy) large enough to push the offset outside the safe band, so
+ * grid_origin never needs to shift and the missing check_grid_boundary
+ * call is invisible. Any future caller that pans by more than a couple
+ * of tile widths in one step would see stale tiles until the next drag
+ * or tracking recentre. Route this through check_grid_boundary too. */
 void map_renderer_pan(map_renderer_t* mr, int32_t dx, int32_t dy)
 {
     double scale = 1.0 / TILE_PX;
@@ -1216,28 +1758,81 @@ void map_renderer_zoom_out(map_renderer_t* mr)
     }
 }
 
+void map_renderer_set_own_sog(map_renderer_t* mr, float sog_knots)
+{
+    if (mr) mr->pos_sog_knots = sog_knots;
+}
+
+void map_renderer_mirror_pos(map_renderer_t* dst, map_renderer_t* src)
+{
+    if (!dst || !src || dst == src || !src->pos_valid) return;
+    /* Skip if already caught up — avoids a needless marker redraw. */
+    if (dst->pos_valid &&
+        dst->pos_lat == src->pos_lat &&
+        dst->pos_lon == src->pos_lon &&
+        dst->pos_cog == src->pos_cog &&
+        dst->pos_sog_knots == src->pos_sog_knots) return;
+    map_renderer_set_position(dst, src->pos_lat, src->pos_lon, src->pos_cog);
+    map_renderer_set_own_sog(dst, src->pos_sog_knots);
+}
+
 void map_renderer_set_position(map_renderer_t* mr, double lat, double lon, float cog_deg)
 {
     mr->pos_lat = lat;
     mr->pos_lon = lon;
-    mr->pos_cog = cog_deg;
+    /* NaN COG can arrive on GPS reacquisition even when SOG is above
+     * the anchor gate. Casting sin/cos(NaN) → NaN → int32_t downstream
+     * in update_marker_position is undefined behaviour and the
+     * deadband check on NaN drift silently never fires, freezing
+     * tracking until COG recovers. Keep the last-known heading
+     * whenever the incoming value is not finite. */
+    if (isfinite(cog_deg)) mr->pos_cog = cog_deg;
     mr->pos_valid = true;
 
     if (mr->tracking) {
-        /* Deadband: keep the map still and only move the marker while the vessel
-         * stays within the central band; re-center (re-render the tile grid)
-         * once it drifts past the threshold. Avoids re-rendering the map for
-         * every small position change. */
         double ptx, pty;
         lat_lon_to_tile(lat, lon, mr->current_zoom, &ptx, &pty);
-        double off_x = (ptx - mr->center_tx) * TILE_PX;
-        double off_y = (pty - mr->center_ty) * TILE_PX;
-        double deadband = mr->vp_size * 0.30;   /* recenter past 30% from middle */
-        if (fabs(off_x) > deadband || fabs(off_y) > deadband) {
-            mr->center_lat = lat;
-            mr->center_lon = lon;
-            update_tile_coords(mr);
-            center_scroll_on_view(mr);   /* repositions tiles + marker */
+
+        /* Where the tile-coord centre SHOULD sit for the vessel to land
+         * on the course-up anchor. Bias vector in tile units:
+         * translate the pixel-space "opposite of COG" unit vector into
+         * tile deltas. Screen y grows southward; north-up map means
+         * tile y grows southward too. So:
+         *   COG   0° (N)  → bias = ( 0,-1)   centre goes NORTH of boat
+         *   COG  90° (E)  → bias = (+1, 0)   centre goes EAST  of boat
+         *   COG 180° (S)  → bias = ( 0,+1)   centre goes SOUTH of boat
+         *   COG 270° (W)  → bias = (-1, 0)   centre goes WEST  of boat
+         * i.e. bias = (sin(cog), -cos(cog)).
+         * Falls back to zero bias (dead-centre) when there's no
+         * meaningful heading available. */
+        /* SOG threshold gates the COG bias — pos_cog is zeroed at
+         * struct init, so a bare "cog!=0" check would treat a
+         * genuine due-north course as "no heading". Trust the COG
+         * only when the vessel is actually making way. */
+        double bias_tx = 0.0, bias_ty = 0.0;
+        if (mr->pos_sog_knots >= MARKER_ANCHOR_MIN_SOG_KNOTS) {
+            double cog_rad = (double)mr->pos_cog * M_PI / 180.0;
+            double offset_tiles = (double)MARKER_ANCHOR_OFFSET_PX / (double)TILE_PX;
+            bias_tx =  sin(cog_rad) * offset_tiles;
+            bias_ty = -cos(cog_rad) * offset_tiles;
+        }
+        double anchor_tx = ptx + bias_tx;
+        double anchor_ty = pty + bias_ty;
+
+        /* Deadband on the DRIFT from the ideal course-up centre. If we
+         * were to recentre right now, the vessel would land exactly on
+         * the anchor point on screen. Once accumulated drift exceeds
+         * 30 % of the viewport in any axis, recentre. */
+        double drift_x = (anchor_tx - mr->center_tx) * TILE_PX;
+        double drift_y = (anchor_ty - mr->center_ty) * TILE_PX;
+        double deadband = mr->vp_size * 0.30;
+        if (fabs(drift_x) > deadband || fabs(drift_y) > deadband) {
+            mr->center_tx = anchor_tx;
+            mr->center_ty = anchor_ty;
+            tile_to_lat_lon(mr->center_tx, mr->center_ty, mr->current_zoom,
+                            &mr->center_lat, &mr->center_lon);
+            /* Single settle call — no earlier apply_pan_offset. See the
+             * comment on check_grid_boundary. */
             check_grid_boundary(mr);
             return;
         }
@@ -1264,7 +1859,15 @@ void map_renderer_track(map_renderer_t* mr)
     mr->center_lat = target_lat;
     mr->center_lon = target_lon;
     update_tile_coords(mr);
-    center_scroll_on_view(mr);
+    /* Single settle path — check_grid_boundary owns the apply_pan_offset
+     * call. Previously we also called center_scroll_on_view here, which
+     * races the parallel draw thread: writer #1 (center_scroll_on_view)
+     * placed the tile widgets for the OLD grid_origin, writer #2
+     * (check_grid_boundary) shifted grid_origin, memcpy'd 25×128 KiB
+     * of tile buffers, and re-placed widgets. The drawer could sample
+     * writer #1's widget positions while writer #2 was still overwriting
+     * the pixel source, giving the vertical-tile-shift flash seen after
+     * a track-button tap. */
     check_grid_boundary(mr);
     update_marker_position(mr);
 }
@@ -1277,7 +1880,7 @@ void map_renderer_create_track_btn(map_renderer_t* mr, lv_obj_t* btn_parent,
     lv_obj_align(mr->track_btn, LV_ALIGN_CENTER, x_ofs, y_ofs);
     lv_obj_set_style_radius(mr->track_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(mr->track_btn, lv_color_hex(0x21262d), 0);
-    lv_obj_set_style_bg_opa(mr->track_btn, LV_OPA_80, 0);
+    lv_obj_set_style_bg_opa(mr->track_btn, LV_OPA_50, 0);
     lv_obj_set_style_border_width(mr->track_btn, 0, 0);
     lv_obj_add_event_cb(mr->track_btn, track_btn_cb, LV_EVENT_CLICKED, mr);
     lv_obj_remove_flag(mr->track_btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -1302,7 +1905,7 @@ void map_renderer_set_alt_tiles(map_renderer_t* mr, const char* alt_tile_base,
     lv_obj_align(mr->theme_btn, LV_ALIGN_CENTER, x_ofs, y_ofs);
     lv_obj_set_style_radius(mr->theme_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(mr->theme_btn, lv_color_hex(0x21262d), 0);
-    lv_obj_set_style_bg_opa(mr->theme_btn, LV_OPA_80, 0);
+    lv_obj_set_style_bg_opa(mr->theme_btn, LV_OPA_50, 0);
     lv_obj_set_style_border_width(mr->theme_btn, 0, 0);
     lv_obj_add_event_cb(mr->theme_btn, theme_btn_cb, LV_EVENT_CLICKED, mr);
     lv_obj_remove_flag(mr->theme_btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -1325,7 +1928,11 @@ static lv_obj_t* make_overlay_btn(lv_obj_t* parent, int32_t x_ofs, int32_t y_ofs
     lv_obj_align(btn, LV_ALIGN_CENTER, x_ofs, y_ofs);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0x21262d), 0);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
+    /* Semi-transparent so the map underneath still shows through — user
+     * ask, matches the badge's blend and the AIS icons' opacity. Set
+     * both here and in set_btn_enabled's enabled branch since that path
+     * repeats the assignment when zoom-in/out cross ZOOM_MIN/MAX. */
+    lv_obj_set_style_bg_opa(btn, LV_OPA_50, 0);
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
     lv_obj_remove_flag(btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -1344,10 +1951,10 @@ static void set_btn_enabled(lv_obj_t* btn, bool enabled)
     if (!btn) return;
     if (enabled) {
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_50, 0);
     } else {
         lv_obj_remove_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_30, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_20, 0);
     }
     /* The button has exactly one child — the lv_image we created. Dim its
      * recolor when disabled so the icon stops looking interactive. */
@@ -1403,8 +2010,7 @@ void map_renderer_render(map_renderer_t* mr)
 {
     if (!mr || !mr->map_container) return;
 
-    /* Fill in any tiles that were cache misses and have now loaded */
-    bool any_updated = false;
+    /* Fill in any tiles that were cache misses and have now loaded. */
     for (int32_t i = 0; i < GRID_TILES; i++) {
         if (mr->tile_loaded[i]) continue;
 
@@ -1420,8 +2026,22 @@ void map_renderer_render(map_renderer_t* mr)
             memcpy(mr->tile_bufs[i], td, TILE_BYTES);
             mr->tile_loaded[i] = true;
             lv_draw_buf_invalidate_cache(&mr->tile_dbufs[i], NULL);
-            lv_obj_invalidate(mr->tile_widgets[i]);
-            any_updated = true;
+            /* Only un-hide if the widget's current position is actually
+             * on-screen. apply_pan_offset hides off-screen tiles as a
+             * render-time optimisation; blindly un-hiding here would
+             * make LVGL redraw off-screen widgets (fps regressed from
+             * ~27 to ~5 flushes/5s with the unconditional un-hide).
+             * Position is the source of truth — read it back. */
+            lv_area_t coords;
+            lv_obj_get_coords(mr->tile_widgets[i], &coords);
+            int32_t rx0 = coords.x1 - lv_obj_get_x(mr->map_group);
+            int32_t ry0 = coords.y1 - lv_obj_get_y(mr->map_group);
+            bool on_screen = (rx0 + TILE_PX > 0 && rx0 < mr->vp_size &&
+                              ry0 + TILE_PX > 0 && ry0 < mr->vp_size);
+            if (on_screen) {
+                lv_obj_remove_flag(mr->tile_widgets[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_invalidate(mr->tile_widgets[i]);
+            }
         }
     }
 }
@@ -1429,3 +2049,71 @@ void map_renderer_render(map_renderer_t* mr)
 double map_renderer_get_lat(map_renderer_t* mr) { return mr->center_lat; }
 double map_renderer_get_lon(map_renderer_t* mr) { return mr->center_lon; }
 int32_t map_renderer_get_zoom(map_renderer_t* mr) { return mr->current_zoom; }
+bool map_renderer_is_tracking(map_renderer_t* mr) { return mr && mr->tracking; }
+bool map_renderer_is_panning(map_renderer_t* mr)  { return mr && mr->panning; }
+
+void map_renderer_get_viewport_bbox(map_renderer_t* mr, map_viewport_bbox_t* out)
+{
+    if (!mr || !out) return;
+    /* Half-viewport in tile units, plus 20% margin so vessels appear at the
+     * edges *before* they physically enter the visible circle. */
+    double half_tx = ((double)mr->vp_size * 0.5 * 1.2) / (double)TILE_PX;
+    double tx_lo = mr->center_tx - half_tx;
+    double tx_hi = mr->center_tx + half_tx;
+    double ty_lo = mr->center_ty - half_tx;  /* square viewport, same scale */
+    double ty_hi = mr->center_ty + half_tx;
+
+    double lat_a, lat_b, lon_a, lon_b;
+    tile_to_lat_lon(tx_lo, ty_lo, mr->current_zoom, &lat_a, &lon_a);  /* top-left */
+    tile_to_lat_lon(tx_hi, ty_hi, mr->current_zoom, &lat_b, &lon_b);  /* bot-right */
+
+    /* In Web-Mercator, ty_lo (smaller Y) maps to HIGHER latitude. */
+    out->lat_max = lat_a;
+    out->lat_min = lat_b;
+    out->lon_min = lon_a;
+    out->lon_max = lon_b;
+    out->zoom    = mr->current_zoom;
+}
+
+lv_obj_t* map_renderer_get_ais_badge(map_renderer_t* mr)
+{
+    return mr ? mr->ais_badge : NULL;
+}
+
+bool map_renderer_focus_mmsi(map_renderer_t* mr, uint32_t mmsi)
+{
+#ifdef ESP_PLATFORM
+    if (!mr || !mmsi) return false;
+    if (!s_ais_v_scratch || !s_ais_a_scratch) return false;
+    ais_vessel_t *vessels = s_ais_v_scratch;
+    size_t n_v = ais_store_get_vessels(vessels, AIS_MAX_VESSELS);
+    for (size_t i = 0; i < n_v; i++) {
+        if (vessels[i].mmsi != mmsi) continue;
+        /* Skip targets whose position is unknown — centering on NAN would
+         * blank the map. Static-info-only entries fall in this bucket. */
+        if (isnan(vessels[i].lat) || isnan(vessels[i].lon)) return false;
+        mr->tracking = false;
+        map_renderer_set_view(mr, vessels[i].lat, vessels[i].lon, mr->current_zoom);
+        map_renderer_refresh_ais(mr);        /* place icons at the new center now */
+        show_ais_card_vessel(mr, &vessels[i]);
+        map_renderer_render(mr);
+        return true;
+    }
+    ais_aton_t *atons = s_ais_a_scratch;
+    size_t n_a = ais_store_get_atons(atons, AIS_MAX_ATONS);
+    for (size_t i = 0; i < n_a; i++) {
+        if (atons[i].mmsi != mmsi) continue;
+        if (isnan(atons[i].lat) || isnan(atons[i].lon)) return false;
+        mr->tracking = false;
+        map_renderer_set_view(mr, atons[i].lat, atons[i].lon, mr->current_zoom);
+        map_renderer_refresh_ais(mr);
+        show_ais_card_aton(mr, &atons[i]);
+        map_renderer_render(mr);
+        return true;
+    }
+    return false;
+#else
+    (void)mr; (void)mmsi;
+    return false;
+#endif
+}

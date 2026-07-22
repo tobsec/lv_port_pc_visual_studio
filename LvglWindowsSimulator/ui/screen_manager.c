@@ -3,10 +3,28 @@
 #include "map_renderer.h"
 #include "tile_cache.h"
 #include "warning_overlay.h"
+#include "ais_screen.h"
+#include "ais_store.h"
+#include "media_screen.h"
+
+/* n2k component REQUIRES ui, so we can't add n2k as a dep of ui without
+ * making the graph cyclic. Forward-declare the one call we need here as
+ * a weak symbol — the linker resolves it against components/n2k when
+ * that component is present, and a NULL call is elided by the runtime
+ * guard below. */
+struct map_renderer;
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void n2k_viewport_set_map(struct map_renderer *mr);
+#else
+/* MSVC (sim build): weak symbols aren't a thing the same way. Just
+ * declare a stub so the address-taken guard below evaluates false-y. */
+static void n2k_viewport_set_map(struct map_renderer *mr) { (void)mr; }
+#endif
 #ifdef ESP_PLATFORM
   #include "last_position.h"
 #endif
 #include "icons/lv_image_telltale_icons.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,9 +43,13 @@ static const char* tile_path = NULL;
 static const char* alt_tile_path = NULL;
 static lv_obj_t* tileview;
 static lv_obj_t* demo_badge = NULL;   /* "DEMO" badge, shown when on simulated data */
-#define NUM_SCREENS 4
-/* Tile order, left → right. Settings sits left of the golden/home screen. */
-enum { SCREEN_SETTINGS = 0, SCREEN_GOLDEN, SCREEN_CHART, SCREEN_ENGINE };
+#define NUM_SCREENS 6
+/* Tile order, left → right. Settings sits left of the golden/home screen;
+ * the AIS list sits between the full chart and the engine detail so
+ * "chart" → "targets I see" reads as a natural progression. Media (the
+ * Fusion control tile) sits between AIS and Engine — both are "boat
+ * status" screens so grouping them keeps the mental model consistent. */
+enum { SCREEN_SETTINGS = 0, SCREEN_GOLDEN, SCREEN_CHART, SCREEN_AIS, SCREEN_MEDIA, SCREEN_ENGINE };
 static int32_t current_screen = SCREEN_GOLDEN;   /* boot on the golden screen */
 static bool swiping = false;       /* true during tileview scroll animation */
 
@@ -35,7 +57,10 @@ static bool swiping = false;       /* true during tileview scroll animation */
 static screen_hooks_t s_hooks;
 static uint8_t s_init_brightness = 100;
 static bool    s_init_demo = true;
+static uint8_t s_init_ais_range_nm = 25;
+static bool    s_init_ap_enabled = true;
 static lv_obj_t* s4_bright_val;
+static lv_obj_t* s4_ais_range_val;
 static warn_thresholds_t s_thr_vals;
 static bool s_thr_set = false;
 static lv_obj_t* thr_val_lbl[THR_COUNT];
@@ -234,12 +259,36 @@ static void bright_slider_cb(lv_event_t* e)
     if (s_hooks.set_brightness) s_hooks.set_brightness((uint8_t)v);
 }
 
+/* AIS range slider — snap to 5-NM steps so the user always lands on a
+ * whole round number. The gauge's PGN 130961 broadcaster reloads the
+ * NVS-persisted range on its next tick (≤5 s after save). */
+static void ais_range_slider_cb(lv_event_t* e)
+{
+    lv_obj_t* sl = (lv_obj_t*)lv_event_get_target(e);
+    int32_t v = lv_slider_get_value(sl);
+    v = ((v + 2) / 5) * 5;              /* round to nearest 5 */
+    if (v < 5)  v = 5;
+    if (v > 40) v = 40;
+    lv_slider_set_value(sl, v, LV_ANIM_OFF);
+    char b[24];
+    snprintf(b, sizeof(b), "AIS range %d NM", (int)v);
+    lv_label_set_text(s4_ais_range_val, b);
+    if (s_hooks.set_ais_range_nm) s_hooks.set_ais_range_nm((uint8_t)v);
+}
+
 static void demo_switch_cb(lv_event_t* e)
 {
     lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
     bool demo = lv_obj_has_state(sw, LV_STATE_CHECKED);
     screen_manager_set_demo(demo);            /* DEMO badge */
     if (s_hooks.set_demo) s_hooks.set_demo(demo);
+}
+
+static void ap_switch_cb(lv_event_t* e)
+{
+    lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
+    bool en = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (s_hooks.set_ap_enabled) s_hooks.set_ap_enabled(en);
 }
 
 static void thr_step(int id, int dir)
@@ -358,6 +407,41 @@ static void create_screen4(lv_obj_t* tile)
     if (s_init_demo) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, demo_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    /* AIS request range — how wide the sim / iOS bridge should pull AIS
+     * around own position when the user hasn't panned away. See
+     * docs/gauge-viewport-protocol.md. */
+    lv_obj_t* ais_sl = lv_slider_create(col);
+    lv_obj_set_size(ais_sl, 360, 18);
+    lv_slider_set_range(ais_sl, 5, 40);
+    lv_slider_set_value(ais_sl, s_init_ais_range_nm, LV_ANIM_OFF);
+    lv_obj_add_event_cb(ais_sl, ais_range_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    s4_ais_range_val = lv_label_create(col);
+    char ab[24];
+    snprintf(ab, sizeof(ab), "AIS range %d NM", (int)s_init_ais_range_nm);
+    lv_label_set_text(s4_ais_range_val, ab);
+    lv_obj_set_style_text_color(s4_ais_range_val, COL_TEXT, 0);
+    lv_obj_set_style_text_font(s4_ais_range_val, &lv_font_montserrat_18, 0);
+
+    /* Wi-Fi hotspot row — mirrors the iOS app's SoftAP switch so the
+     * user can flip it directly on the gauge. Reads/writes the same
+     * NVS-backed setting through the hook. */
+    lv_obj_t* aprow = lv_obj_create(col);
+    lv_obj_set_size(aprow, 560, 48);
+    lv_obj_set_style_bg_opa(aprow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(aprow, 0, 0);
+    lv_obj_set_style_pad_all(aprow, 0, 0);
+    lv_obj_remove_flag(aprow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* apl = lv_label_create(aprow);
+    lv_label_set_text(apl, "Wi-Fi hotspot");
+    lv_obj_set_style_text_color(apl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(apl, &lv_font_montserrat_20, 0);
+    lv_obj_align(apl, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t* apsw = lv_switch_create(aprow);
+    lv_obj_align(apsw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (s_init_ap_enabled) lv_obj_add_state(apsw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(apsw, ap_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     /* Editable warning thresholds */
     for (int i = 0; i < THR_COUNT; i++) create_thr_row(col, i);
 }
@@ -377,16 +461,88 @@ static void tileview_scroll_begin_cb(lv_event_t* e)
     swiping = true;
 }
 
+/* Sync map view state (center lat/lon + zoom) FROM `src` TO `dst`. Called
+ * on tileview swipe-end so both maps always show the same area — user's
+ * ask ("have the feeling it's really the same"). Side effect: shrinks
+ * the total unique AIS-viewport area (both maps agree on one bbox) so
+ * the app doesn't have to fetch a superset for whichever map is bigger. */
+static void sync_map_view(map_renderer_t* src, map_renderer_t* dst)
+{
+    if (!src || !dst || src == dst) return;
+    double lat = map_renderer_get_lat(src);
+    double lon = map_renderer_get_lon(src);
+    int32_t zoom = map_renderer_get_zoom(src);
+    if (map_renderer_get_lat(dst) == lat &&
+        map_renderer_get_lon(dst) == lon &&
+        map_renderer_get_zoom(dst) == zoom) return;   /* already in sync */
+    map_renderer_set_view(dst, lat, lon, zoom);
+}
+
+/* Heavy post-swipe work: view sync, pos mirror, viewport re-target,
+ * and render. sync_map_view can trigger set_view → load_grid_tiles
+ * which memcpys up to 25 × 128 KB (3.2 MB) from tile_cache into the
+ * per-map buffers; doing that synchronously in the scroll_end event
+ * stalled the LVGL task ~500 ms and the first post-animation frame
+ * felt stuck. Deferring here via lv_async_call lets LVGL render at
+ * least one clean settled frame before the reload runs. */
+static void scroll_end_deferred_cb(void *arg)
+{
+    int prev_screen = (int)(intptr_t)arg;
+    map_renderer_t* gs = golden_screen_get_map();
+    bool prev_was_map = (prev_screen == SCREEN_GOLDEN || prev_screen == SCREEN_CHART);
+    bool now_is_map   = (current_screen == SCREEN_GOLDEN || current_screen == SCREEN_CHART);
+    if (prev_was_map && now_is_map && prev_screen != current_screen) {
+        map_renderer_t* src = (prev_screen == SCREEN_GOLDEN) ? gs      : s2_map;
+        map_renderer_t* dst = (current_screen == SCREEN_GOLDEN) ? gs   : s2_map;
+        sync_map_view(src, dst);
+        map_renderer_mirror_pos(dst, src);
+    }
+    /* Push the currently-visible map's bbox to the ais_store so the
+     * incoming feed gets filtered to what the user is actually looking
+     * at. Runs on every scroll_end, even when the user swipes back to
+     * the same-view state (cheap, only prunes if bbox changed). */
+    {
+        map_renderer_t* active = NULL;
+        if      (current_screen == SCREEN_GOLDEN && gs)     active = gs;
+        else if (current_screen == SCREEN_CHART  && s2_map) active = s2_map;
+        if (active) {
+            map_viewport_bbox_t bb;
+            map_renderer_get_viewport_bbox(active, &bb);
+#ifdef ESP_PLATFORM
+            ais_store_set_viewport(bb.lat_min, bb.lat_max,
+                                   bb.lon_min, bb.lon_max);
+#else
+            (void)bb;
+#endif
+        }
+    }
+    if (&n2k_viewport_set_map) {
+        map_renderer_t* vp_src = NULL;
+        if      (current_screen == SCREEN_CHART  && s2_map) vp_src = s2_map;
+        else if (current_screen == SCREEN_GOLDEN && gs)     vp_src = gs;
+        if (vp_src) n2k_viewport_set_map((struct map_renderer *)vp_src);
+    }
+    /* Only render the freshly-visible map — the other one isn't on
+     * screen and can pick up cache-arrived tiles the next time it
+     * becomes visible via this same async path. */
+    if (current_screen == SCREEN_GOLDEN && gs) map_renderer_render(gs);
+    if (current_screen == SCREEN_CHART  && s2_map) map_renderer_render(s2_map);
+}
+
 static void tileview_scroll_end_cb(lv_event_t* e)
 {
     (void)e;
     swiping = false;
+    int32_t prev_screen = current_screen;
     /* Update current_screen from the tileview's active tile */
     lv_obj_t* active = lv_tileview_get_tile_active(tileview);
     if (active) {
         int32_t col = lv_obj_get_x(active) / DISP_SIZE;
         if (col >= 0 && col < NUM_SCREENS) current_screen = col;
     }
+    /* Defer the heavy work so the settled screen paints first — see
+     * comment on scroll_end_deferred_cb. */
+    lv_async_call(scroll_end_deferred_cb, (void *)(intptr_t)prev_screen);
 }
 
 /* Tile-ready timer: polls for background tile loads, re-renders maps */
@@ -460,6 +616,29 @@ void screen_manager_create(void)
 
     lv_obj_t* tc = lv_tileview_add_tile(tileview, SCREEN_CHART, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     create_screen2(tc);
+
+    lv_obj_t* tais = lv_tileview_add_tile(tileview, SCREEN_AIS, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+#ifdef ESP_PLATFORM
+    /* The AIS list reads from ais_store, which is a firmware-only component
+     * (needs FreeRTOS + esp_timer). Sim keeps an empty AIS tile so tile
+     * ordering + swipe navigation stay consistent between hw and sim. */
+    ais_screen_create(tais);
+#else
+    /* Placeholder so the tile isn't just a black square — makes it obvious
+     * we haven't crashed, and names the reason it's empty. */
+    lv_obj_set_style_bg_color(tais, lv_color_hex(0x0d1117), 0);
+    lv_obj_set_style_bg_opa(tais, LV_OPA_COVER, 0);
+    lv_obj_t* ais_stub = lv_label_create(tais);
+    lv_label_set_text(ais_stub,
+        "AIS\n\n(firmware-only —\nno store on sim)");
+    lv_obj_set_style_text_align(ais_stub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(ais_stub, lv_color_hex(0x8b949e), 0);
+    lv_obj_set_style_text_font(ais_stub, &lv_font_montserrat_20, 0);
+    lv_obj_center(ais_stub);
+#endif
+
+    lv_obj_t* tmed = lv_tileview_add_tile(tileview, SCREEN_MEDIA, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    media_screen_create(tmed);
 
     lv_obj_t* te = lv_tileview_add_tile(tileview, SCREEN_ENGINE, 0, LV_DIR_LEFT);
     create_screen3(te);
@@ -539,6 +718,18 @@ void screen_manager_set_hooks(const screen_hooks_t* hooks, uint8_t init_brightne
     s_init_demo = init_demo;
 }
 
+void screen_manager_set_ais_range(uint8_t nm)
+{
+    if (nm < 5)  nm = 5;
+    if (nm > 40) nm = 40;
+    s_init_ais_range_nm = nm;
+}
+
+void screen_manager_set_ap_enabled(bool enabled)
+{
+    s_init_ap_enabled = enabled;
+}
+
 void screen_manager_set_thresholds(const warn_thresholds_t* t)
 {
     if (!t) return;
@@ -560,6 +751,56 @@ void screen_manager_update(const gauge_data_t* d)
 
     /* Warning overlay — always run: its debounce/timeouts are time-based. */
     warning_overlay_update(d);
+
+    /* Store-driven refreshes MUST run above the gauge_data change-guard
+     * below. `d` from the CAN pipeline can be bit-for-bit identical for
+     * many seconds (boat idle at the dock, no live GPS, engine off)
+     * while BLE-forwarded AIS targets keep arriving in the background.
+     * Anything that depends on ais_store rather than d has to tick on
+     * its own cadence, otherwise the map goes blank of AIS icons and
+     * the AIS list freezes until something else nudges `d`.
+     *
+     * All three timers throttle to their own rates so this stays cheap:
+     * 2 s for the two map refreshes (matches the pre-guard cadence),
+     * 1 s for the list. */
+#ifdef ESP_PLATFORM
+    uint32_t now_ms_ais = (uint32_t)(lv_tick_get());
+
+    if (current_screen == SCREEN_AIS) {
+        static uint32_t s_ais_last_ms = 0;
+        if (now_ms_ais - s_ais_last_ms >= 1000) {
+            s_ais_last_ms = now_ms_ais;
+            ais_screen_update(d, now_ms_ais);
+        }
+    }
+
+    /* Chart map's AIS overlay — every 2 s while visible, but frozen
+     * while the user is swiping between tiles OR dragging the chart.
+     * refresh_ais snapshots the store and repaints every visible
+     * widget; running it mid-gesture stutters the drag / swipe for no
+     * benefit (reposition_ais_only inside apply_pan_offset already
+     * keeps icons attached to the map during pan). */
+    if (current_screen == SCREEN_CHART && s2_map &&
+        !swiping && !map_renderer_is_panning(s2_map)) {
+        static uint32_t s_chart_ais_last = 0;
+        if (now_ms_ais - s_chart_ais_last >= 2000) {
+            s_chart_ais_last = now_ms_ais;
+            map_renderer_refresh_ais(s2_map);
+        }
+    }
+
+    /* Golden inset map's AIS overlay — same cadence + same freeze. */
+    if (current_screen == SCREEN_GOLDEN && !swiping) {
+        map_renderer_t* gs = golden_screen_get_map();
+        if (gs && !map_renderer_is_panning(gs)) {
+            static uint32_t s_gold_ais_last = 0;
+            if (now_ms_ais - s_gold_ais_last >= 2000) {
+                s_gold_ais_last = now_ms_ais;
+                map_renderer_refresh_ais(gs);
+            }
+        }
+    }
+#endif
 
     /* Skip all value/widget updates when nothing relevant changed, so a static
      * screen (e.g. no CAN data, all "---") does no rendering and idles the CPU.
@@ -594,20 +835,26 @@ void screen_manager_update(const gauge_data_t* d)
     if (current_screen == SCREEN_GOLDEN)
         golden_screen_update(d);
 
-    /* Full-size map + SOG/COG overlay */
+    /* Full-size map + SOG/COG overlay. NVS position persistence lives
+     * here (and mirrored from the golden inset in golden_screen_update)
+     * so pan history survives a reboot regardless of which map screen
+     * the user last touched. */
     if (current_screen == SCREEN_CHART) {
         static uint32_t s2_map_frame = 0;
         if (++s2_map_frame >= 40) {
             s2_map_frame = 0;
             if (s2_map && d->latitude != 0.0 && d->longitude != 0.0) {
                 map_renderer_set_position(s2_map, d->latitude, d->longitude, d->cog_degrees);
+                map_renderer_set_own_sog(s2_map, d->sog_knots);
 #ifdef ESP_PLATFORM
                 last_position_maybe_save(d->latitude, d->longitude,
                                          d->cog_degrees,
                                          map_renderer_get_zoom(s2_map));
 #endif
             }
-            if (s2_map) map_renderer_refresh_ais(s2_map);
+            /* refresh_ais moved above the change-guard — see the comment
+             * up there. Leaving a redundant call here would just cost an
+             * extra store snapshot + widget invalidation cycle. */
         }
         static uint32_t s2_label_frame = 0;
         if (++s2_label_frame >= 5) {
@@ -618,6 +865,12 @@ void screen_manager_update(const gauge_data_t* d)
     }
 
     /* Engine detail labels */
+    /* Media (Fusion) — refresh once per screen update tick; the
+     * screen's own rev-guard makes it a no-op when nothing changed. */
+    if (current_screen == SCREEN_MEDIA) {
+        media_screen_update();
+    }
+
     if (current_screen == SCREEN_ENGINE) {
         static uint32_t s3_frame = 0;
         if (++s3_frame < 2) goto s3_skip;  /* ~10Hz at 20Hz input */
@@ -663,6 +916,16 @@ map_renderer_t* screen_manager_get_active_map(void)
     switch (current_screen) {
         case SCREEN_GOLDEN: return golden_screen_get_map();
         case SCREEN_CHART:  return s2_map;
+        case SCREEN_AIS:    return NULL;
         default: return NULL;
     }
+}
+
+map_renderer_t* screen_manager_get_chart_map(void) { return s2_map; }
+
+void screen_manager_show_chart(void)
+{
+    if (!tileview) return;
+    swiping = true;
+    lv_tileview_set_tile_by_index(tileview, SCREEN_CHART, 0, LV_ANIM_ON);
 }

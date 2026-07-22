@@ -2,6 +2,8 @@
 #define MAP_RENDERER_H
 
 #include "lvgl/lvgl.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +43,22 @@ void map_renderer_zoom_out(map_renderer_t* mr);
  * If tracking is enabled, the map auto-centers on the position.
  */
 void map_renderer_set_position(map_renderer_t* mr, double lat, double lon, float cog_deg);
+
+/**
+ * Update own-ship SOG (knots), used for CPA/TCPA computation against
+ * AIS targets on the tap-to-inspect card. Cheap; call alongside
+ * map_renderer_set_position from the data tick.
+ */
+void map_renderer_set_own_sog(map_renderer_t* mr, float sog_knots);
+
+/**
+ * Copy own-vessel position + heading + SOG state (pos_valid / lat / lon
+ * / COG / SOG_knots) from `src` to `dst`. Useful on screen swipe so the
+ * newly-visible map immediately shows the yellow COG marker without
+ * waiting for the next data tick — otherwise the destination map's
+ * pos_valid stays false until set_position runs under its own guard.
+ */
+void map_renderer_mirror_pos(map_renderer_t* dst, map_renderer_t* src);
 
 /**
  * Re-enable tracking (auto-center on vessel).
@@ -103,6 +121,54 @@ void map_renderer_refresh_ais(map_renderer_t* mr);
 double map_renderer_get_lat(map_renderer_t* mr);
 double map_renderer_get_lon(map_renderer_t* mr);
 int32_t map_renderer_get_zoom(map_renderer_t* mr);
+
+/**
+ * True when the map auto-centers on own position (default after
+ * map_renderer_track). Set to false as soon as the user pans; re-set by
+ * map_renderer_track. The viewport broadcaster uses this to decide
+ * whether to publish an override or fall back to own-pos + range.
+ */
+bool map_renderer_is_tracking(map_renderer_t* mr);
+
+/**
+ * True while the user's finger is dragging the chart (PRESSING with
+ * cumulative non-zero movement, cleared on RELEASED / PRESS_LOST).
+ * screen_manager uses this to skip refresh_ais during a drag —
+ * repainting all icons on every 2-s tick while the user is scrubbing
+ * the map is expensive and unnecessary; reposition_ais_only inside
+ * apply_pan_offset already keeps the icons glued to the chart.
+ */
+bool map_renderer_is_panning(map_renderer_t* mr);
+
+/**
+ * Current visible viewport as a lat/lon bounding box with 20% margin.
+ * lat_max > lat_min, lon_max > lon_min (crossing anti-meridian is not
+ * handled — irrelevant for Adriatic use).
+ */
+typedef struct {
+    double  lat_min, lat_max;
+    double  lon_min, lon_max;
+    int32_t zoom;
+} map_viewport_bbox_t;
+
+void map_renderer_get_viewport_bbox(map_renderer_t* mr, map_viewport_bbox_t* out);
+
+/**
+ * Center on an AIS target by MMSI and pop the target-detail card.
+ * Turns tracking off (the user is now looking at that target, not own
+ * ship). If `mmsi` is not in the store (either as a vessel or an AtoN)
+ * this is a no-op. Called from the AIS list tile when the user taps a
+ * row so the chart jumps to the vessel with its info card open. Returns
+ * true when the target was found and the view was updated.
+ */
+bool map_renderer_focus_mmsi(map_renderer_t* mr, uint32_t mmsi);
+
+/**
+ * Get the AIS status badge widget so a parent screen can reposition it
+ * when the default (aligned to chart_area TOP_MID + 18) collides with
+ * other UI. Returns NULL if the badge hasn't been built yet.
+ */
+struct _lv_obj_t* map_renderer_get_ais_badge(map_renderer_t* mr);
 
 #ifdef __cplusplus
 }

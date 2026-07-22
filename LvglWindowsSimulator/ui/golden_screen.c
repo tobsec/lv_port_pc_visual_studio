@@ -1,5 +1,8 @@
 #include "golden_screen.h"
 #include "map_renderer.h"
+#ifdef ESP_PLATFORM
+  #include "last_position.h"
+#endif
 #include "icons/lv_image_telltale_icons.h"
 #include <stdio.h>
 #include <math.h>
@@ -901,10 +904,14 @@ void golden_screen_create(lv_obj_t* parent)
              * loading is async (no blocking SD reads during boot). */
             /* Vignette disabled — pixel-by-pixel alpha blend is too expensive on ESP32 */
             /* map_renderer_set_vignette(gs_map, 0.65f, COL_BG); */
-            map_renderer_create_track_btn(gs_map, root, 220, 60);
-            map_renderer_create_zoom_btns(gs_map, root, -30, 60, 30, 60);
+            /* Buttons dropped further to y_ofs 120 (absolute y=520) so
+             * they sit in the gap just above the row-1 engine pods
+             * (which start at y=545). Anything higher was overlapping
+             * the visible map. */
+            map_renderer_create_track_btn(gs_map, root, 220, 120);
+            map_renderer_create_zoom_btns(gs_map, root, -30, 120, 30, 120);
             if (alt_tile_path) {
-                map_renderer_set_alt_tiles(gs_map, alt_tile_path, root, -220, 60);
+                map_renderer_set_alt_tiles(gs_map, alt_tile_path, root, -220, 120);
             }
         }
     } else {
@@ -1165,6 +1172,17 @@ void golden_screen_create(lv_obj_t* parent)
 
     can_engine_state = -1;     /* force first golden_screen_update() to paint */
     can_nav_state    = -1;
+
+    /* Skip the map's AIS status badge on the golden screen — the
+     * inset chart shares its top band with the SOG panel and RPM
+     * scale, so any position for the 100 x 26 pill either covers
+     * something valuable or itself gets covered. The AIS list tile
+     * (SCREEN_AIS) and the full chart's own badge already give the
+     * user the "AIS is/isn't flowing" signal, so nothing is lost. */
+    if (gs_map) {
+        lv_obj_t* badge = map_renderer_get_ais_badge(gs_map);
+        if (badge) lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /* ════════════════════════════════════════════
@@ -1251,8 +1269,20 @@ void golden_screen_update(const gauge_data_t* d)
         map_frame = 0;
         if (gs_map && d->latitude != 0.0 && d->longitude != 0.0) {
             map_renderer_set_position(gs_map, d->latitude, d->longitude, d->cog_degrees);
+            map_renderer_set_own_sog(gs_map, d->sog_knots);
+#ifdef ESP_PLATFORM
+            /* Mirror the full-screen chart's NVS persistence so pan +
+             * zoom survive a reboot when the user only touched the
+             * golden inset map. last_position_maybe_save internally
+             * throttles by distance so both call sites landing at
+             * ~0.5 Hz is fine. */
+            last_position_maybe_save(d->latitude, d->longitude,
+                                     d->cog_degrees,
+                                     map_renderer_get_zoom(gs_map));
+#endif
         }
-        if (gs_map) map_renderer_refresh_ais(gs_map);
+        /* refresh_ais lifted to screen_manager_update above the change-
+         * guard so AIS icons refresh even when gauge_data is static. */
     }
 
     /* Stagger slow-changing value updates across frames to avoid invalidation spikes.
